@@ -36,8 +36,8 @@ fmt:  ## Auto-fix + format with ruff
 	uvx ruff check --fix .
 	uvx ruff format .
 
-bench:  ## Metrics harness (stub until T5)
-	@echo "bench is a stub until T5 — see infrared/bench/harness.py"
+bench:  ## Metrics spine: ladder + knee sweep (tiny CPU model; --model for real weights)
+	$(PY) -m infrared.bench
 
 clean:  ## Remove caches / build artifacts
 	rm -rf .pytest_cache .ruff_cache *.egg-info build dist

@@ -33,6 +33,9 @@ PURE_SUBMODULES = [
     "infrared.server.app",
     "infrared.bench",
     "infrared.bench.harness",
+    "infrared.bench.metrics",
+    "infrared.bench.workload",
+    "infrared.bench.report",
 ]
 
 # Modules that legitimately import torch (real forward-pass / engine code).

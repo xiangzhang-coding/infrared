@@ -35,7 +35,7 @@ Single RTX 4090 (24 GB) via AutoDL, ¥500 budget (inherited from `inference-lear
 
 ## Repo layout
 
-T0 (single-request forward) and T1 (static batching + HTTP) are implemented; later rungs are still stubs. Names mirror the R1 architecture blueprint (`docs/research/vllm-v1-nano-vllm-blueprint.md`), split along the one seam that matters — request orchestration vs model execution:
+T0 (single-request forward) and T1 (static batching + HTTP) are implemented, plus the **metrics spine** (issue #7) that measures any config; later rungs are still stubs. Names mirror the R1 architecture blueprint (`docs/research/vllm-v1-nano-vllm-blueprint.md`), split along the one seam that matters — request orchestration vs model execution:
 
 ```
 infrared/
@@ -57,7 +57,12 @@ infrared/
     kv_cache.py        #   contiguous per-request KV cache (batch-first)      (T0/T1)
     block_manager.py   #   PagedAttention block manager (stub)                (T3)
   server/app.py        #   FastAPI OpenAI /v1/completions (non-streaming)     (T1)
-  bench/harness.py     #   metrics spine / before→after ladder (stub)         (T5)
+  bench/               # metrics spine — the "done" ladder (drives every tier)
+    metrics.py         #   percentiles / TTFT·TPOT / goodput / knee (pure)    (spine)
+    workload.py        #   categories + Poisson arrival process (pure)        (spine)
+    report.py          #   Markdown/CSV ladder + knee-curve renderers (pure)  (spine)
+    harness.py         #   load driver + correctness/throughput/util + measure(spine)
+    __main__.py        #   `python -m infrared.bench` CLI                     (spine)
 ```
 
 ## Development
@@ -95,6 +100,25 @@ curl localhost:8000/v1/completions -H 'Content-Type: application/json' \
 
 Static batching is deliberately the naive baseline for T2: the response carries a non-standard `infrared_batch` field (`prompt_pad_tokens`, `decode_slack_tokens`, …) so you can *see* the padding waste and head-of-line blocking a continuous-batching scheduler will remove.
 
+### Metrics spine (the "done" ladder)
+
+One command turns any engine config into a single honest row — `(correctness, throughput, goodput, utilization)` — and the request-rate **knee sweep** behind it (ADR-0002, `CONTEXT.md` §Metrics). It's the unified measurement entry every future tier plugs into.
+
+```bash
+make bench                                  # tiny random model on CPU (no GPU, no download)
+python -m infrared.bench --model Qwen/Qwen2.5-0.5B-Instruct   # real weights (cached)
+python -m infrared.bench --rates 5,25,100,400 --ttft-ms 500 --tpot-ms 100
+```
+
+What each column means, and how they stay honest:
+
+- **correctness** — A/B every prompt (greedy) against an oracle, tallied *per category*; passing needs every category exact. The default oracle is the T0 single-request path, itself HF-parity-gated, so a match is batch-invariance vs HF transitively.
+- **throughput** — sustained output tok/s on a fixed decode-heavy shape.
+- **goodput / knee** — offer requests open-loop at rising rates (Poisson arrivals); **goodput** is the rate of requests that individually meet the SLO, and the **knee** is the highest offered rate whose p99 TTFT/TPOT still fit — *not* saturated throughput.
+- **utilization** — the T1 evidence is the **batch-fill rate** (real decode work ÷ the padded lockstep grid) over a mixed workload, where a static batch's padding + head-of-line waste shows up. GPU util fills in on CUDA; KV-block occupancy arrives with paged KV (T3).
+
+The pure math (percentiles, TTFT/TPOT, goodput, knee, renderers) lives in `bench/metrics.py`, `bench/workload.py`, and `bench/report.py` and is unit-tested without torch; `bench/harness.py` is the thin driver that records real traces off a running engine. The **method and load are reproducible** (seeded Poisson arrivals + seeded prompts); absolute wall-clock latencies are machine-dependent, so the artifact is about *relative* per-tier gains, not absolute SOTA (spec §Testing, Seam B).
+
 ## Status
 
-🛠️ **Building** — T0 (single-request forward, HF-parity gated) and T1 (static batching + OpenAI-compatible HTTP) are in; T2 (continuous batching) is next. The plan lives as a [wayfinder map issue](https://github.com/xiangzhang-coding/infrared/issues) with build tickets. See `docs/spec/`, `docs/adr/`, and `CONTEXT.md` for the settled decisions and glossary.
+🛠️ **Building** — T0 (single-request forward, HF-parity gated) and T1 (static batching + OpenAI-compatible HTTP) are in, plus the **metrics spine** (`python -m infrared.bench`) that scores any config and drives the before→after ladder; T2 (continuous batching) is next. The plan lives as a [wayfinder map issue](https://github.com/xiangzhang-coding/infrared/issues) with build tickets. See `docs/spec/`, `docs/adr/`, and `CONTEXT.md` for the settled decisions and glossary.
