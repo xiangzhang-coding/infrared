@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "infrared"
+version = "0.0.0"
+description = "A from-scratch LLM inference engine (Qwen2.5), built tier by tier (T0-T6)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "xiangzhang-coding" }]
+keywords = [
+    "llm",
+    "inference",
+    "engine",
+    "paged-attention",
+    "continuous-batching",
+    "qwen2.5",
+]
+
+# Runtime dependencies — pinned to the newer-stable versions from R2 (issue #3,
+# docs/research/deps-and-qwen25-arch.md). The rationale for each pin lives in
+# that note. Do NOT bump torch/triton independently: torch's own wheel pins
+# triton==3.7.1, and triton only ships Linux wheels (hence the marker below),
+# so the whole runtime stack is Linux + GPU. Dev/CI on other platforms uses the
+# `dev` extra with `--no-deps` (see the Makefile `install-dev` target).
+dependencies = [
+    "torch==2.13.0",
+    "triton==3.7.1 ; platform_system == 'Linux'",
+    # HF transformers/safetensors are the weight source + correctness oracle
+    # (ADR-0005), never an execution path (ADR-0003).
+    "transformers==5.15.0",
+    "safetensors==0.8.0",
+    # T5 serving shell.
+    "fastapi==0.141.1",
+    "uvicorn==0.52.3",
+]
+
+[project.optional-dependencies]
+# Test + lint tooling — installable on any platform without a GPU, so the
+# scaffold's acceptance checks (pytest smoke, ruff clean) run in no-GPU mode.
+# R2 (#3) lists no versions for these, so we pin the current stable lines.
+# This is the single source of truth for the dev-tool versions (see Makefile).
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.16.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/xiangzhang-coding/infrared"
+Tracker = "https://github.com/xiangzhang-coding/infrared/issues"
+
+[tool.setuptools.packages.find]
+include = ["infrared*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+# ruff is our *code* linter/formatter. Don't reach into prose: recent ruff
+# formats Python fences inside Markdown, which would rewrite the runnable
+# snippets in docs/ (e.g. the research notes) — not this project's job.
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+# E/F = pycodestyle+pyflakes, I = isort, UP = pyupgrade, B = bugbear.
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = "-ra"
