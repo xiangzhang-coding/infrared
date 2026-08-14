@@ -19,22 +19,28 @@ keywords = [
     "qwen2.5",
 ]
 
-# Runtime dependencies — pinned to the newer-stable versions from R2 (issue #3,
-# docs/research/deps-and-qwen25-arch.md). The rationale for each pin lives in
-# that note. Do NOT bump torch/triton independently: torch's own wheel pins
-# triton==3.7.1, and triton only ships Linux wheels (hence the marker below),
-# so the whole runtime stack is Linux + GPU. Dev/CI on other platforms uses the
-# `dev` extra with `--no-deps` (see the Makefile `install-dev` target).
+# Runtime dependencies — pinned to the versions this repo is actually
+# VERIFIED-GREEN against (70 tests + HF parity pass under these). See
+# docs/research/deps-and-qwen25-arch.md and ADR-0006. R2's original pins were
+# fictional-future (torch 2.13.0 / transformers 5.15.0 / safetensors 0.8.0 /
+# uvicorn 0.52.3 / triton 3.7.1) and could not install — corrected here.
+# triton is NOT pinned by us: torch's Linux CUDA wheel resolves its own exact
+# triton, and triton ships Linux wheels only — so the runtime stack is
+# Linux + GPU. Dev/CI on other platforms uses the `dev` extra with `--no-deps`
+# (see the Makefile `install-dev` target).
 dependencies = [
-    "torch==2.13.0",
-    "triton==3.7.1 ; platform_system == 'Linux'",
+    "torch==2.12.0",
+    # triton is pulled transitively by torch's Linux wheel (T4 imports it); we
+    # don't assert a version we haven't run — pin it exactly once observed on
+    # the GPU box when T4 lands (ADR-0006).
+    "triton ; platform_system == 'Linux'",
     # HF transformers/safetensors are the weight source + correctness oracle
     # (ADR-0005), never an execution path (ADR-0003).
-    "transformers==5.15.0",
-    "safetensors==0.8.0",
+    "transformers==4.56.2",
+    "safetensors==0.7.0",
     # T5 serving shell.
     "fastapi==0.141.1",
-    "uvicorn==0.52.3",
+    "uvicorn==0.45.0",
 ]
 
 [project.optional-dependencies]

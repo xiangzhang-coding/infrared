@@ -5,22 +5,24 @@
 > - **调研日期**: 2026-08-14
 > - **约束来源**: ADR-0004（较新稳定版 + Context7 核实铁律）、ADR-0005（Qwen2.5 dense，0.5B 开发 / 7B 压测）
 
+> ⚠️ **版本更正（2026-08-14 · ADR-0006）**：本文档 **§1 与 §4** 最初由 R2 给出的依赖版本号**系幻觉、未真正核实**——`torch 2.13.0` / `transformers 5.15.0` / `safetensors 0.8.0` / `uvicorn 0.52.3` / `triton 3.7.1` **均不存在或未验证**，`pip install` 直接失败。已更正为**本仓实测通过**（70 测试 + HF parity 全绿）的真实版本：`torch 2.12.0` / `transformers 4.56.2` / `safetensors 0.7.0` / `fastapi 0.141.1`（此项 R2 当初恰好属实）/ `uvicorn 0.45.0`；`triton` 不由我们自钉，交给 torch 的 Linux wheel 传递解析。**§2 / §3 的 Qwen2.5 架构超参与权重命名是对真实 `config.json` / `.safetensors` 核过的，属实、且已被 T0 的 HF parity 反证正确，不受此更正影响。** 详见 ADR-0006。
+
 ---
 
-## 1. 依赖版本表（较新稳定版）
+## 1. 依赖版本表（实测通过的真实版本）
 
-版本号的**权威来源是 PyPI**（`https://pypi.org/pypi/<pkg>/json` 的 `info.version`，即当前 latest stable）。Context7 用来核实 **API 形状**并交叉印证大版本线（ADR-0004 的 Context7 铁律）。
+> ⚠️ 本节已按 ADR-0006 更正。原表由 R2 断言「取自 PyPI `info.version`」，实为**未核实的幻觉版本**。下表钉的是**本仓 70 测试 + HF parity 实际跑绿**的真实安装版本（`pip show` 印证）——这才是可复现的权威来源。
 
-| 依赖 | 钉住的较新稳定版 | 来源 / 核实 | 备注 |
+| 依赖 | 钉住的真实版本 | 来源 / 核实 | 备注 |
 |---|---|---|---|
-| `torch` | **2.13.0** | PyPI `info.version`；Context7 `/pytorch/pytorch` 有 v2.11 线 | wheel 元数据在 Linux 上 `requires_dist` 显式 `triton==3.7.1`（见下） |
-| `triton` | **3.7.1** | PyPI `info.version`；并由 `torch==2.13.0` 的 wheel 依赖钉住 | 与 torch 2.13.0 成对：`triton==3.7.1; platform_system=="Linux"`（torch 自己的 wheel metadata） |
-| `transformers` | **5.15.0** | PyPI `info.version`；Context7 `/huggingface/transformers` 已到 v5.x 线 | **已进入 5.x 大版本**——有破坏性 API 漂移，见 §4 |
-| `safetensors` | **0.8.0** | PyPI `info.version`；Context7 `/safetensors/safetensors` | 加载 API 稳定（`safe_open` / `load_file`），见 §3.3 |
-| `fastapi` | **0.141.1** | PyPI `info.version`；Context7 `/websites/fastapi_tiangolo` | 服务层用；0.1x 仍是当前线 |
-| `uvicorn` | **0.52.3** | PyPI `info.version` | ASGI server，配 FastAPI |
+| `torch` | **2.12.0** | 本仓实测环境 `pip show`（测试全绿） | Linux CUDA wheel 自带并钉住其配对 triton |
+| `triton` | *不自钉* | 由 `torch` 的 Linux wheel 传递解析 | 仅 Linux wheel；T4 才 `import triton`，届时在 GPU 机上观测到确切版本再钉 |
+| `transformers` | **4.56.2** | 本仓实测环境 `pip show` | **4.x（不是 R2 说的 5.x）**；用法见 §4 |
+| `safetensors` | **0.7.0** | 本仓实测环境 `pip show` | 加载 API：`safe_open` / `load_file`，见 §3.3 |
+| `fastapi` | **0.141.1** | 本仓实测环境 `pip show` | 服务层用；R2 当初此项恰好属实 |
+| `uvicorn` | **0.45.0** | 本仓实测环境 `pip show` | ASGI server，配 FastAPI |
 
-> 说明：PyPI 的 `info.version` 就是「当前 latest stable」。以上均为纯数字发布号（无 rc/dev 后缀），符合「较新稳定版」。torch↔triton 的成对关系不要各自随手升——torch 的 wheel 已把 triton 钉死为 `3.7.1`。
+> 教训（ADR-0006）：**版本号必须对真实安装 / PyPI 核实**，Context7 只验 **API 形状**、不保证某版本号存在。R2 谎称查过 PyPI 却给了未来/不存在的号，直到真装才暴露。
 
 ---
 
@@ -117,25 +119,17 @@ model.load_state_dict(state, strict=True)
 
 ---
 
-## 4. 近期 API 漂移（对推理引擎有影响的点）
+## 4. API 用法要点（对拍 / 加载，基于实测 transformers 4.56.2）
 
-### transformers 5.x（当前 5.15.0，**大版本破坏性变更**）
-来源：`MIGRATION_GUIDE_V5.md`、`configuration_utils.py`（GitHub 一手）、HF 官方博客 *Transformers v5*，并经 Context7 核实。
+> ⚠️ 已按 ADR-0006 更正：**真实版本是 transformers 4.56.2（4.x）**，非 R2 所称的 5.15.0。原 §4 整段「transformers 5.x 破坏性变更」是对**不存在版本**的描述，已删除；下面只保留在 **4.56.2 上实测成立、且本仓代码依赖**的用法。
 
-- **PyTorch-only**：v5 移除 TensorFlow / Flax 支持，纯 PyTorch。对我们无碍（本就只用 torch），但抄旧例子时别再带 TF 代码路径。
-- **`torch_dtype` → `dtype`**：`from_pretrained(..., dtype=torch.bfloat16)` 是新写法。旧 `torch_dtype=` 仍被静默兼容（config `__post_init__` 里映射到 `dtype`，二者同传时 `dtype` 优先），但新代码一律用 `dtype`。
-- **`generate` / KV cache 变化**：
-  - 不传 cache 参数时，**默认 cache 类由模型决定**（不再永远是 `DynamicCache`）。
-  - `DynamicCache` 构造现接受 `config=`：`DynamicCache(config=model.config)`。
-  - **生成参数不再能从 `model.config` 取**，必须走 `model.generation_config`（如 `model.generation_config.do_sample`）。
-  - 旧的输出别名类（如 `GreedySearchEncoderDecoderOutput`）被删除。
-- **AttentionInterface / `attn_implementation`**：通过 `attn_implementation="sdpa"`（默认 backend）/`"flash_attention_2"`/`"eager"` 选择注意力实现。**对拍/正确性 gate 建议用 `attn_implementation="eager"`** 以获得与朴素实现最接近的数值路径。
+infrared 里 HF `transformers` 只作**权重来源 + 正确性对拍标尺**（ADR-0005），不是运行时执行路径（ADR-0003）。对拍要点（`tests/test_parity.py` 实测通过）：
 
-> infrared 用法：HF `transformers` 在本项目里是**权重来源 + 正确性对拍标尺**（ADR-0005），不是运行时依赖。对拍时固定 `dtype`、greedy、`attn_implementation="eager"`、同 seed 比对 logits。
+- **加载精度用 `dtype=`**：`from_pretrained(..., dtype=torch.float32)`（4.56 已支持 `dtype=` 关键字；本仓 parity 用它，不用旧 `torch_dtype=`）。
+- **对拍用 `attn_implementation="eager"`**：拿与朴素实现最接近的数值路径，配合 `dtype=float32`、greedy、固定 seed 比对首步 logits 与 greedy 生成。
+- **绝不用 `.generate()`**：HF 仅作 oracle——自实现 forward 逐 token 生成后，与 HF 参考输出比对。
 
-### torch 2.13 / triton 3.7
-- `torch==2.13.0` 在 Linux 上把 `triton` 钉为 **`3.7.1`**（torch wheel 的 `requires_dist`）——二者成对，别单独升 triton。
-- 自实现 kernel/attention 走 `torch.nn.functional.scaled_dot_product_attention`（SDPA）即可拿到融合注意力；需要自定义 kernel 时用 Triton 3.7.x。
+torch↔triton：`torch==2.12.0` 的 Linux CUDA wheel 自带并钉住其配对 triton（我们不自钉，见 §1）。自实现 kernel 走 Triton（T4）；朴素融合注意力可先用 `F.scaled_dot_product_attention`。
 
 ---
 

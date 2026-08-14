@@ -35,7 +35,7 @@ Single RTX 4090 (24 GB) via AutoDL, ¥500 budget (inherited from `inference-lear
 
 ## Repo layout
 
-T0 (single-request forward) and T1 (static batching + HTTP) are implemented, plus the **metrics spine** (issue #7) that measures any config; later rungs are still stubs. Names mirror the R1 architecture blueprint (`docs/research/vllm-v1-nano-vllm-blueprint.md`), split along the one seam that matters — request orchestration vs model execution:
+T0 (single-request forward), T1 (static batching + HTTP), **T2 (continuous batching), and T3 (paged KV)** are implemented and verified (HF parity + the before→after ladder both run green), plus the **metrics spine** (issue #7) that measures any config; T4/T5/T6 are not built yet. Names mirror the R1 architecture blueprint (`docs/research/vllm-v1-nano-vllm-blueprint.md`), split along the one seam that matters — request orchestration vs model execution:
 
 ```
 infrared/

@@ -11,6 +11,7 @@
 
 - **参考蓝图，非净室**：允许 agent 拿 **vLLM v1 架构** + 公开的 **"nano-vLLM"** 当**蓝图**学真实形状；但**重新写带讲解注释的代码，不 copy-paste**。infrared 骨架有意贴近真 vLLM，以最大化「读码学真东西」的价值。
 - **较新稳定版**：用**较新的稳定版** API/依赖（PyTorch / Triton / `transformers` / FastAPI）。
+- **版本号须实证**（ADR-0006 补强）：**具体版本号必须对真实安装（`pip show`）或 PyPI 核实**，并落到实测跑绿的组合；**Context7 只验 API 形状、不保证某版本号存在**，绝不凭断言写版本号。（R2 违反此条、给了幻觉版本，见 ADR-0006。）
 - **Context7 铁律**：任何 API/flag/签名**不确定处，一律先用 Context7 MCP 核实**再写，杜绝幻觉参数。
 
 ## Consequences（后果）
