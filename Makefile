@@ -5,7 +5,7 @@
 # lets `make test` / `make lint` run green.
 
 .DEFAULT_GOAL := help
-.PHONY: help install install-dev test lint fmt bench clean
+.PHONY: help install install-dev test lint fmt bench parity clean
 
 PY ?= python3
 
@@ -22,8 +22,12 @@ install-dev:  ## No-GPU install: infrared + test/lint tools, skips torch/triton
 	# name here so the no-GPU path can't drift from that single source.
 	uv pip install pytest ruff
 
-test:  ## Run the test suite (scaffold smoke tests)
+test:  ## Run the test suite (parity tests skip unless the model is cached)
 	$(PY) -m pytest
+
+parity:  ## Seam-A gate: fetch Qwen2.5-0.5B (~1GB) + run HF parity (needs torch+transformers)
+	$(PY) -c "from huggingface_hub import snapshot_download as s; s('Qwen/Qwen2.5-0.5B-Instruct')"
+	$(PY) -m pytest tests/test_parity.py -v
 
 lint:  ## Lint with ruff (uvx = no separate install needed)
 	uvx ruff check .

@@ -62,12 +62,22 @@ Runtime deps (torch / triton / transformers / …) are pinned to the versions in
 
 ```bash
 make install-dev   # editable install + pytest/ruff, no torch/triton
-make test          # pytest smoke: every submodule imports; prints dep versions
+make test          # unit + smoke tests (parity tests skip unless the model is cached)
 make lint          # ruff check (via uvx)
 make install       # full runtime install — Linux + GPU only
 ```
 
-The scaffold never touches a GPU or downloads a model, so `make test` / `make lint` pass anywhere.
+The scaffold-level tests never touch a GPU or download a model, so `make test` / `make lint` pass anywhere.
+
+### Correctness gate (Seam A)
+
+T0's acceptance is that infrared's forward matches HF `transformers` on the same weights (greedy output + first-step logits). That gate lives in `tests/test_parity.py` and **skips** unless `Qwen2.5-0.5B-Instruct` is cached locally. To run it (downloads ~1 GB once, runs on CPU):
+
+```bash
+make parity        # fetch the 0.5B weights, then run the HF parity test
+```
+
+HF is used only as the weight source (+ tokenizer) and the reference oracle — never via `.generate()` (ADR-0003).
 
 ## Status
 

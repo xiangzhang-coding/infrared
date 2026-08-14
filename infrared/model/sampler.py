@@ -1,17 +1,27 @@
-"""Token sampling (T0 — stub): greedy first, then temperature / top-p.
+"""Token sampling (T0): greedy + temperature.
 
-The correctness gate (Seam A, ``docs/spec/0001`` §Testing) runs greedy with a
-fixed seed and compares logits against HF ``transformers`` (eager) on the same
-weights — so the greedy path here must be numerically boring on purpose.
+Greedy (``temperature == 0``) is deterministic argmax — the mode the Seam-A
+parity gate uses so infrared and HF must agree token-for-token. Temperature
+sampling scales logits then draws from the softmax; pass a seeded
+``torch.Generator`` for reproducibility.
 """
 
 from __future__ import annotations
 
-_T0 = "not implemented until T0 — see docs/spec/0001 §Testing"
+import torch
 
 
 class Sampler:
-    """Maps logits → next-token id per the request's sampling params."""
+    """Maps a logits vector to the next token id."""
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        raise NotImplementedError(_T0)
+    def sample(
+        self,
+        logits: torch.Tensor,
+        temperature: float = 0.0,
+        generator: torch.Generator | None = None,
+    ) -> int:
+        """Pick the next token from ``logits`` (shape ``[vocab]``)."""
+        if temperature <= 0.0:
+            return int(torch.argmax(logits, dim=-1))
+        probs = torch.softmax(logits.to(torch.float32) / temperature, dim=-1)
+        return int(torch.multinomial(probs, num_samples=1, generator=generator))

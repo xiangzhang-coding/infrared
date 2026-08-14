@@ -13,37 +13,50 @@ import importlib
 import subprocess
 import sys
 
+from pytest import importorskip
+
 import infrared
 
-# Every module the scaffold ships. Importing all of them is the core assertion:
-# the tree is wired up and free of import-time side effects / heavy deps.
-SUBMODULES = [
+# Modules that stay pure Python (import with no heavy deps) — always importable.
+PURE_SUBMODULES = [
     "infrared",
     "infrared.config",
     "infrared.model",
-    "infrared.model.layers",
-    "infrared.model.qwen2",
+    "infrared.model.config",
     "infrared.model.model_runner",
-    "infrared.model.sampler",
     "infrared.engine",
     "infrared.engine.sequence",
     "infrared.engine.scheduler",
     "infrared.engine.engine",
     "infrared.cache",
     "infrared.cache.block_manager",
-    "infrared.cache.kv_cache",
     "infrared.server",
     "infrared.server.app",
     "infrared.bench",
     "infrared.bench.harness",
 ]
 
+# Modules that legitimately import torch (real forward-pass code lands at T0).
+TORCH_SUBMODULES = [
+    "infrared.model.layers",
+    "infrared.model.qwen2",
+    "infrared.model.sampler",
+    "infrared.model.generate",
+    "infrared.cache.kv_cache",
+]
+
 # Pinned runtime deps (R2 / issue #3) — optional in no-GPU dev mode.
 OPTIONAL_DEPS = ["torch", "triton", "transformers", "safetensors", "fastapi", "uvicorn"]
 
 
-def test_all_submodules_import() -> None:
-    for name in SUBMODULES:
+def test_pure_submodules_import() -> None:
+    for name in PURE_SUBMODULES:
+        importlib.import_module(name)
+
+
+def test_torch_submodules_import() -> None:
+    importorskip("torch")
+    for name in TORCH_SUBMODULES:
         importlib.import_module(name)
 
 
