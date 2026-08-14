@@ -98,6 +98,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--max-batch", type=int, default=8)
     parser.add_argument(
+        "--block-size", type=int, default=16, help="paged KV block size (T3)"
+    )
+    parser.add_argument(
+        "--num-blocks", type=int, default=128, help="paged KV pool size in blocks (T3)"
+    )
+    parser.add_argument(
         "--rates",
         default="5,25,100,400",
         help="comma-separated offered request rates (req/s) for the knee sweep",
@@ -118,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     from infrared.engine.engine import ContinuousBatchEngine, StaticBatchEngine
+    from infrared.engine.paged_engine import PagedBatchEngine
 
     model = _real_model(args.model) if args.model else _tiny_model()
     label = args.model or "tiny random model (CPU)"
@@ -127,8 +134,8 @@ def main(argv: list[str] | None = None) -> int:
     oracle = t0_oracle(model)
 
     # Measure each tier on the identical model + workload + SLO so the ladder's
-    # deltas are attributable to the *mechanism* (static vs continuous), nothing
-    # else. Both engines share the submit/Pending surface the harness drives.
+    # deltas are attributable to the *mechanism* alone, nothing else. Every engine
+    # shares the submit/Pending surface the harness drives.
     def _measure(make_engine, tier: str, notes: str):
         engine = make_engine().start()
         try:
@@ -153,27 +160,41 @@ def main(argv: list[str] | None = None) -> int:
     t2 = _measure(
         lambda: ContinuousBatchEngine(model, max_num_seqs=args.max_batch),
         tier="T2 continuous batch",
-        notes=f"{label} · per-seq forward (varlen batched fwd → T3 paged KV)",
+        notes=f"{label} · per-seq forward (batched fwd → T3)",
+    )
+    t3 = _measure(
+        lambda: PagedBatchEngine(
+            model,
+            max_num_seqs=args.max_batch,
+            block_size=args.block_size,
+            num_blocks=args.num_blocks,
+        ),
+        tier="T3 +paged KV",
+        notes=f"{label} · paged {args.num_blocks}×{args.block_size} · batched decode",
     )
 
     print(f"# infrared metrics spine — {label}\n")
     print("## Before→after ladder\n")
-    print(build_ladder([t1, t2]))
+    print(build_ladder([t1, t2, t3]))
     print(
-        "\n> **Reading the T2 row.** Continuous batching's T2 win is **latency"
-        " (TTFT)** and **utilization**: iteration-level scheduling eliminates"
-        " static batching's prompt padding and head-of-line waste, so batch-fill"
-        " goes to 100% and p99 TTFT drops sharply (see the sweeps below).\n>"
-        " **Throughput / goodput can *regress* vs T1 here** — T2 forwards each"
-        " sequence on its own (no flattened varlen batched matmul yet), so on a"
-        " uniform burst T1's single batched GEMM is faster. The batched varlen"
-        " forward — the raw-throughput lever — lands with paged KV at **T3**; T2"
-        " deliberately isolates the *scheduling* mechanism (R1 §5, §8)."
+        "\n> **Reading the ladder.** **T2** (continuous batch) removes static"
+        " batching's prompt padding + head-of-line waste (batch-fill → 100%) and"
+        " streams a real TTFT, but forwards each sequence alone — so raw"
+        " throughput can lag T1's single batched GEMM. **T3** (+paged KV) bundles"
+        " two mechanisms, so read its deltas accordingly: the **KV-occupancy** and"
+        " **concurrent-sequences-per-KV-budget** gains are attributable to *paging*"
+        " (on-demand fixed-size blocks, no worst-case reservation, no"
+        " fragmentation); the **throughput/goodput** gain over T2 is attributable"
+        " to *batched decode* (one matmul across the running set), which paging"
+        " enables. The Triton paged-attn kernel that fuses the gather is T4 (R1"
+        " §5, §8)."
     )
     print("\n## T1 static batch — knee sweep (request-rate up-scan)\n")
     print(render_sweep_markdown(t1.sweep))
     print("\n## T2 continuous batch — knee sweep (request-rate up-scan)\n")
     print(render_sweep_markdown(t2.sweep))
+    print("\n## T3 +paged KV — knee sweep (request-rate up-scan)\n")
+    print(render_sweep_markdown(t3.sweep))
     return 0
 
 

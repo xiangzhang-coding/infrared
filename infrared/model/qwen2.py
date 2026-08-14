@@ -91,8 +91,9 @@ class Qwen2ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         attn_mask: torch.Tensor,
-        kv_cache: KVCache,
+        kv_cache: KVCache | None = None,
         start_col: int = 0,
+        paged: object = None,
     ) -> torch.Tensor:
         """Batched forward: ``input_ids`` ``[B, S]`` -> logits ``[B, S, vocab]``.
 
@@ -100,10 +101,18 @@ class Qwen2ForCausalLM(nn.Module):
         are precomputed by the caller (``forward_single`` for one request, the
         static-batch runner for many). ``start_col`` is the shared KV column the
         first token of this step writes to.
+
+        Pass ``paged`` (a ``PagedContext``) to route KV through the T3 paged pool
+        instead of a contiguous ``kv_cache``; the two are mutually exclusive.
         """
         cos, sin = self.rotary(positions)
         ctx = ForwardContext(
-            cos=cos, sin=sin, mask=attn_mask, kv_cache=kv_cache, start_col=start_col
+            cos=cos,
+            sin=sin,
+            mask=attn_mask,
+            kv_cache=kv_cache,
+            start_col=start_col,
+            paged=paged,
         )
         h = self.model(input_ids, ctx)
         return self.lm_head(h)

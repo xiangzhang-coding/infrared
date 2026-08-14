@@ -72,6 +72,10 @@ class Sequence:
     num_prompt_tokens: int = field(init=False)
     generated: list[int] = field(init=False, default_factory=list)
 
+    # Logical→physical KV mapping (T3 paged engine). Empty for the T2 contiguous
+    # cache; the paged ``BlockManager`` fills/clears it on allocate/preempt/free.
+    block_table: list[int] = field(init=False, default_factory=list)
+
     # Torch-side handles, attached by the engine (kept out of the decision layer).
     kv: KVCache | None = field(default=None, repr=False)
     generator: torch.Generator | None = field(default=None, repr=False)

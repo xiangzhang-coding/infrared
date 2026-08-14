@@ -443,10 +443,16 @@ class ContinuousBatchEngine:
             pending.first_token_time = time.perf_counter()
             pending.first_token.set()
         if seq.should_stop(token):
+            self._release(seq)
             if pending is not None:
                 pending.complete(seq.generated)
                 self._pending.pop(seq.seq_id, None)
             self.scheduler.retire(seq)
+
+    def _release(self, seq: Sequence) -> None:
+        """Release a finished sequence's KV. No-op here (the contiguous cache is
+        dropped with the ``Sequence``); the paged engine overrides this to return
+        the sequence's blocks to the pool."""
 
     def _record(self, stats: BatchStats) -> None:
         with self._stats_lock:

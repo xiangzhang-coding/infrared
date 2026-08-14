@@ -45,6 +45,9 @@ class BatchStats:
     prompt_pad_tokens: int  # left-pad tokens forced through prefill
     decode_steps: int  # lockstep steps run (== the longest generation)
     decode_slack_tokens: int  # finished-seq slots still forwarded (HOL blocking)
+    # Used token-slots / allocated block-slots at this step (T3 paged KV only;
+    # None for the contiguous T1/T2 caches, which have no block pool).
+    kv_block_occupancy: float | None = None
 
 
 @dataclass(slots=True)

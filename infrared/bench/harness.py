@@ -219,7 +219,9 @@ def utilization_from(batch_stats: Sequence[BatchStats]) -> Utilization:
     ``batch_fill_rate`` = real decode work / padded-lockstep grid; the gap is the
     head-of-line waste T2 removes. ``fill_over_time`` is the per-batch fill in
     submission (time) order — ADR-0002's "填充率随时间曲线". ``prompt_pad_fraction``
-    = left-pad tokens / prefill grid. KV-block occupancy is ``None`` until T3.
+    = left-pad tokens / prefill grid. ``kv_block_occupancy`` is the mean of the
+    per-step paged-pool occupancy the engine recorded (``None`` for the
+    contiguous T1/T2 caches, which have no block pool) — ADR-0002's KV-occupancy.
     """
     fill_over_time: list[float] = []
     for bs in batch_stats:
@@ -232,11 +234,15 @@ def utilization_from(batch_stats: Sequence[BatchStats]) -> Utilization:
     total_pad = sum(bs.prompt_pad_tokens for bs in batch_stats)
     fill = (total_slots - total_slack) / total_slots if total_slots else None
     pad_frac = total_pad / total_prefill if total_prefill else None
+    kv_vals = [
+        bs.kv_block_occupancy for bs in batch_stats if bs.kv_block_occupancy is not None
+    ]
+    kv_occ = sum(kv_vals) / len(kv_vals) if kv_vals else None
     return Utilization(
         batch_fill_rate=fill,
         prompt_pad_fraction=pad_frac,
         gpu_util_pct=sample_gpu_util(),
-        kv_block_occupancy=None,
+        kv_block_occupancy=kv_occ,
         fill_over_time=fill_over_time,
     )
 
@@ -433,8 +439,8 @@ def measure(
 
 # Tiers below don't exist yet; the ladder names them so the artifact reads as
 # "one row per mechanism, filled in as it's built" rather than silently short.
-# T2 (continuous batch) is now built, so it drops off the pending list.
-_PENDING_TIERS = ("T3 +paged KV", "T4 +Triton kernel")
+# T2 (continuous batch) and T3 (+paged KV) are now built, so they drop off.
+_PENDING_TIERS = ("T4 +Triton kernel",)
 
 
 def build_ladder(results: Sequence[MeasureResult], include_pending: bool = True) -> str:

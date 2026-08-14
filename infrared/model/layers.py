@@ -25,6 +25,7 @@ from infrared.model.config import Qwen2Config
 
 if TYPE_CHECKING:
     from infrared.cache.kv_cache import KVCache
+    from infrared.cache.paged_kv_cache import PagedContext
 
 
 @dataclass(slots=True)
@@ -35,13 +36,20 @@ class ForwardContext:
     ``DecoderLayer`` → ``Attention`` (the RoPE tables, the additive attention
     mask, the KV cache, and the shared start column). ``layer_idx`` stays a
     separate argument since it varies per layer.
+
+    Two KV backends share this context. The **contiguous** path (T0/T1/T2) uses
+    ``kv_cache`` + ``start_col`` — one padded frame, shared column. The **paged**
+    path (T3) sets ``paged`` instead: a shared block pool addressed per-token by
+    scatter/gather (``kv_cache``/``start_col`` are then unused). Attention picks
+    the backend by whether ``paged`` is ``None``.
     """
 
     cos: torch.Tensor
     sin: torch.Tensor
     mask: torch.Tensor
-    kv_cache: KVCache
+    kv_cache: KVCache | None
     start_col: int
+    paged: PagedContext | None = None
 
 
 class RMSNorm(nn.Module):
@@ -154,8 +162,18 @@ class Attention(nn.Module):
 
         q, k = apply_rotary_pos_emb(q, k, ctx.cos, ctx.sin)
 
-        # Append this step's K/V at the shared column and read the full history.
-        k_all, v_all = ctx.kv_cache.update(layer_idx, k, v, ctx.start_col)
+        # Append this step's (rotated) K/V and read back the full history. Two
+        # backends: contiguous (shared column) or paged (scatter/gather by slot).
+        if ctx.paged is None:
+            assert ctx.kv_cache is not None
+            k_all, v_all = ctx.kv_cache.update(layer_idx, k, v, ctx.start_col)
+        else:
+            paged = ctx.paged
+            h, d = self.num_kv_heads, self.head_dim
+            paged.pool.write(
+                layer_idx, k.reshape(-1, h, d), v.reshape(-1, h, d), paged.write_slots
+            )
+            k_all, v_all = paged.pool.gather(layer_idx, paged.gather_slots)
         k_all = repeat_kv(k_all, self.n_rep)
         v_all = repeat_kv(v_all, self.n_rep)
 

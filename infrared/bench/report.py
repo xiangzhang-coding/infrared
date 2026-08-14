@@ -47,6 +47,12 @@ def _gpu_cell(row: LadderRow) -> str:
     return f"{row.utilization.gpu_util_pct:.0f}%"
 
 
+def _kv_cell(row: LadderRow) -> str:
+    if row.utilization is None:
+        return _DASH
+    return _pct(row.utilization.kv_block_occupancy)
+
+
 _LADDER_HEADERS = (
     "Tier",
     "Correctness",
@@ -54,6 +60,7 @@ _LADDER_HEADERS = (
     "Goodput req/s",
     "Knee req/s",
     "Batch-fill",
+    "KV occ",
     "GPU util",
     "Notes",
 )
@@ -73,6 +80,7 @@ def render_ladder_markdown(rows: Sequence[LadderRow]) -> str:
             _fmt(row.goodput_reqs_per_s, ".2f"),
             _fmt(row.knee_rate, ".2f"),
             _fill_cell(row),
+            _kv_cell(row),
             _gpu_cell(row),
             row.notes or _DASH,
         ]
