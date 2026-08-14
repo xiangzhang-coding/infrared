@@ -54,7 +54,7 @@ def generate(
 
     # --- Prefill: one forward over the whole prompt. ---
     ids = torch.tensor(prompt, dtype=torch.long, device=device)
-    logits = model(ids, kv, start_pos=0)
+    logits = model.forward_single(ids, kv, start_pos=0)
     next_logits = logits[-1]
     pos = len(prompt)
 
@@ -66,7 +66,7 @@ def generate(
         if token in stop or len(generated) >= max_new_tokens:
             break  # stop, or we just sampled the last requested token
         step_ids = torch.tensor([token], dtype=torch.long, device=device)
-        logits = model(step_ids, kv, start_pos=pos)
+        logits = model.forward_single(step_ids, kv, start_pos=pos)
         next_logits = logits[-1]
         pos += 1
 

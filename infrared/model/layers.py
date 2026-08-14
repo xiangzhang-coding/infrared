@@ -1,23 +1,47 @@
-"""Qwen2.5 transformer building blocks (T0).
+"""Qwen2.5 transformer building blocks (T0 math, batch-first since T1).
 
 Hand-written to match HF ``transformers`` Qwen2 numerically (the Seam-A parity
-gate depends on it). Qwen2-specific facts baked in (R2 §3): QKV projections have
-a **bias**, O and MLP do **not**; RoPE ``theta=1e6``; RMSNorm ``eps=1e-6``;
-grouped-query attention repeats each KV head ``num_heads // num_kv_heads`` times.
+gate depends on it). Tensors are batch-first ``[B, S, ...]``; single-request T0
+is just ``B = 1``. Static batching (T1) pads a batch to a common width and drives
+attention with an **additive mask** (causal + padding), which is why the core
+attention takes a precomputed mask rather than positions.
 
-We **own** the attention + KV path (``causal_attention`` + the ``Attention``
-module read/write an external KV cache); embedding/MLP/norm use standard
-``torch`` ops. The KV interface here is what the T3 paged block manager will
-reimplement behind the same call shape.
+Qwen2 facts baked in (R2 §3): QKV projections have a **bias**, O and MLP do
+**not**; RoPE ``theta=1e6``; RMSNorm ``eps=1e-6``; GQA repeats each KV head
+``num_heads // num_kv_heads`` times. We **own** the attention + KV path; the KV
+``update`` call is the seam the T3 paged block manager will reimplement.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from infrared.model.config import Qwen2Config
+
+if TYPE_CHECKING:
+    from infrared.cache.kv_cache import KVCache
+
+
+@dataclass(slots=True)
+class ForwardContext:
+    """Per-step inputs shared by every layer of one forward pass.
+
+    Bundles what used to be threaded as loose args through ``Qwen2Model`` →
+    ``DecoderLayer`` → ``Attention`` (the RoPE tables, the additive attention
+    mask, the KV cache, and the shared start column). ``layer_idx`` stays a
+    separate argument since it varies per layer.
+    """
+
+    cos: torch.Tensor
+    sin: torch.Tensor
+    mask: torch.Tensor
+    kv_cache: KVCache
+    start_col: int
 
 
 class RMSNorm(nn.Module):
@@ -46,46 +70,43 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rotary_pos_emb(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply RoPE to q and k. q/k are ``[S, H, D]``; cos/sin are ``[S, D]``."""
+    """Apply RoPE to q and k. q/k are ``[B, S, H, D]``; cos/sin are ``[B, S, D]``."""
     # Cast the (fp32) tables to the activation dtype, as HF does, so RoPE never
     # silently upcasts activations (a no-op in fp32; matters once T1 runs bf16).
-    cos = cos.unsqueeze(1).to(q.dtype)  # [S, 1, D] broadcasts over heads
-    sin = sin.unsqueeze(1).to(q.dtype)
+    cos = cos.unsqueeze(2).to(q.dtype)  # [B, S, 1, D] broadcasts over heads
+    sin = sin.unsqueeze(2).to(q.dtype)
     q_rot = q * cos + rotate_half(q) * sin
     k_rot = k * cos + rotate_half(k) * sin
     return q_rot, k_rot
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Expand ``[S, H_kv, D]`` to ``[S, H_kv * n_rep, D]`` for GQA.
+    """Expand ``[B, S, H_kv, D]`` to ``[B, S, H_kv * n_rep, D]`` for GQA.
 
     Output head ``j`` maps to KV head ``j // n_rep`` (matches HF ``repeat_kv``).
     """
     if n_rep == 1:
         return x
-    return x.repeat_interleave(n_rep, dim=1)
+    return x.repeat_interleave(n_rep, dim=2)
 
 
-def causal_attention(
+def masked_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    q_pos: torch.Tensor,
-    k_pos: torch.Tensor,
+    mask: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    """Single-request scaled-dot-product attention with an explicit causal mask.
+    """Batched scaled-dot-product attention with an additive mask.
 
-    Shapes: q ``[Sq, H, D]``; k, v ``[Sk, H, D]`` (already repeated to H heads).
-    ``q_pos`` / ``k_pos`` are absolute token positions, so this works for both
-    prefill (Sq == Sk, triangular) and decode (Sq == 1 attending all history).
-    Softmax is computed in fp32 for parity, then cast back.
+    Shapes: q ``[B, Sq, H, D]``; k, v ``[B, Sk, H, D]`` (already repeated to H
+    heads); ``mask`` broadcasts to ``[B, H, Sq, Sk]`` (0 where allowed,
+    ``finfo.min`` where disallowed — covers both causality and padding). Softmax
+    is computed in fp32 for parity, then cast back.
     """
-    scores = torch.einsum("qhd,khd->hqk", q, k) * scale  # [H, Sq, Sk]
-    mask = k_pos[None, :] > q_pos[:, None]  # [Sq, Sk]: a key after the query
-    scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
+    scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * scale + mask
     attn = torch.softmax(scores.to(torch.float32), dim=-1).to(q.dtype)
-    return torch.einsum("hqk,khd->qhd", attn, v)  # [Sq, H, D]
+    return torch.einsum("bhqk,bkhd->bqhd", attn, v)
 
 
 class RotaryEmbedding(nn.Module):
@@ -100,8 +121,8 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # positions [S] -> freqs [S, D/2] -> emb [S, D]
-        freqs = positions.to(torch.float32)[:, None] * self.inv_freq[None, :]
+        # positions [B, S] -> freqs [B, S, D/2] -> emb [B, S, D]
+        freqs = positions.to(torch.float32)[..., None] * self.inv_freq
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
@@ -124,32 +145,22 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, h, bias=False)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        kv_cache: object,
-        layer_idx: int,
-        start_pos: int,
+        self, x: torch.Tensor, ctx: ForwardContext, layer_idx: int
     ) -> torch.Tensor:
-        seq = x.shape[0]
-        q = self.q_proj(x).view(seq, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(seq, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x).view(seq, self.num_kv_heads, self.head_dim)
+        b, seq, _ = x.shape
+        q = self.q_proj(x).view(b, seq, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(b, seq, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(b, seq, self.num_kv_heads, self.head_dim)
 
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q, k = apply_rotary_pos_emb(q, k, ctx.cos, ctx.sin)
 
-        # Append this step's K/V and read back the full history for this layer.
-        k_all, v_all = kv_cache.update(layer_idx, k, v, start_pos)
+        # Append this step's K/V at the shared column and read the full history.
+        k_all, v_all = ctx.kv_cache.update(layer_idx, k, v, ctx.start_col)
         k_all = repeat_kv(k_all, self.n_rep)
         v_all = repeat_kv(v_all, self.n_rep)
 
-        total = k_all.shape[0]
-        q_pos = torch.arange(start_pos, start_pos + seq, device=x.device)
-        k_pos = torch.arange(total, device=x.device)
-        out = causal_attention(q, k_all, v_all, q_pos, k_pos, self.scale)
-
-        out = out.reshape(seq, self.num_heads * self.head_dim)
+        out = masked_attention(q, k_all, v_all, ctx.mask, self.scale)
+        out = out.reshape(b, seq, self.num_heads * self.head_dim)
         return self.o_proj(out)
 
 

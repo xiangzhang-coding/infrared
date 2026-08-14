@@ -35,25 +35,29 @@ Single RTX 4090 (24 GB) via AutoDL, ¥500 budget (inherited from `inference-lear
 
 ## Repo layout
 
-The package is a scaffold today (empty, import-safe stubs); each subpackage is filled in by a later rung. Names mirror the R1 architecture blueprint (`docs/research/vllm-v1-nano-vllm-blueprint.md`), split along the one seam that matters — CPU-side decisions vs GPU-side execution:
+T0 (single-request forward) and T1 (static batching + HTTP) are implemented; later rungs are still stubs. Names mirror the R1 architecture blueprint (`docs/research/vllm-v1-nano-vllm-blueprint.md`), split along the one seam that matters — request orchestration vs model execution:
 
 ```
 infrared/
-  config.py            # EngineConfig (block_size, budgets, gpu_mem_util, …) — data only
-  engine/              # CPU-side orchestration
-    engine.py          #   busy loop: add_request / step / generate            (T1)
-    scheduler.py       #   continuous-batching schedule / preempt / postprocess (T2)
-    sequence.py        #   Sequence + SequenceStatus state machine             (T1)
-  model/               # GPU-side execution
+  config.py            # EngineConfig (block_size, budgets, …) — data only
+  model/               # model execution (batch-first; B=1 is the T0 path)
+    config.py          #   Qwen2Config, read from HF config.json               (T0)
     layers.py          #   RMSNorm / RoPE / GQA attention / SwiGLU             (T0)
-    qwen2.py           #   Qwen2.5 forward + safetensors weight loading        (T0)
-    model_runner.py    #   Worker: prepare_inputs / forward / gather logits    (T1)
-    sampler.py         #   greedy / temperature / top-p                        (T0)
-  cache/               # PagedAttention KV
-    block_manager.py   #   Block + BlockManager (paged allocator)             (T3)
-    kv_cache.py        #   physical KV tensors + profile-based sizing         (T3)
-  server/app.py        # thin FastAPI serving shell                           (T5)
-  bench/harness.py     # metrics spine / before→after ladder                  (T5)
+    inputs.py          #   positions + additive causal/padding masks           (T1)
+    qwen2.py           #   Qwen2.5 forward + safetensors loader (tied lm_head) (T0)
+    sampler.py         #   greedy / temperature                               (T0)
+    generate.py        #   single-request prefill→decode + tokenizer path     (T0)
+    model_runner.py    #   Worker seam (stub)                                 (T3+)
+  engine/              # request orchestration
+    static_batch.py    #   static batch: left-pad prefill + lockstep decode   (T1)
+    engine.py          #   StaticBatchEngine: request queue + worker thread   (T1)
+    scheduler.py       #   continuous-batching scheduler (stub)               (T2)
+    sequence.py        #   Sequence state machine (stub)                      (T2)
+  cache/
+    kv_cache.py        #   contiguous per-request KV cache (batch-first)      (T0/T1)
+    block_manager.py   #   PagedAttention block manager (stub)                (T3)
+  server/app.py        #   FastAPI OpenAI /v1/completions (non-streaming)     (T1)
+  bench/harness.py     #   metrics spine / before→after ladder (stub)         (T5)
 ```
 
 ## Development
@@ -79,6 +83,18 @@ make parity        # fetch the 0.5B weights, then run the HF parity test
 
 HF is used only as the weight source (+ tokenizer) and the reference oracle — never via `.generate()` (ADR-0003).
 
+### Serving (T1)
+
+Run the OpenAI-compatible server (loads `Qwen2.5-0.5B-Instruct` by default; override with `INFRARED_MODEL`):
+
+```bash
+uvicorn infrared.server.app:build_app --factory --port 8000
+curl localhost:8000/v1/completions -H 'Content-Type: application/json' \
+  -d '{"prompt": "The capital of France is", "max_tokens": 16}'
+```
+
+Static batching is deliberately the naive baseline for T2: the response carries a non-standard `infrared_batch` field (`prompt_pad_tokens`, `decode_slack_tokens`, …) so you can *see* the padding waste and head-of-line blocking a continuous-batching scheduler will remove.
+
 ## Status
 
-🗺️ **Charting** — the plan lives as a [wayfinder map issue](https://github.com/xiangzhang-coding/infrared/issues) with build tickets. See `docs/spec/`, `docs/adr/`, and `CONTEXT.md` for the settled decisions and glossary.
+🛠️ **Building** — T0 (single-request forward, HF-parity gated) and T1 (static batching + OpenAI-compatible HTTP) are in; T2 (continuous batching) is next. The plan lives as a [wayfinder map issue](https://github.com/xiangzhang-coding/infrared/issues) with build tickets. See `docs/spec/`, `docs/adr/`, and `CONTEXT.md` for the settled decisions and glossary.

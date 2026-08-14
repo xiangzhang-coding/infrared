@@ -27,7 +27,6 @@ PURE_SUBMODULES = [
     "infrared.engine",
     "infrared.engine.sequence",
     "infrared.engine.scheduler",
-    "infrared.engine.engine",
     "infrared.cache",
     "infrared.cache.block_manager",
     "infrared.server",
@@ -36,13 +35,16 @@ PURE_SUBMODULES = [
     "infrared.bench.harness",
 ]
 
-# Modules that legitimately import torch (real forward-pass code lands at T0).
+# Modules that legitimately import torch (real forward-pass / engine code).
 TORCH_SUBMODULES = [
     "infrared.model.layers",
+    "infrared.model.inputs",
     "infrared.model.qwen2",
     "infrared.model.sampler",
     "infrared.model.generate",
     "infrared.cache.kv_cache",
+    "infrared.engine.static_batch",
+    "infrared.engine.engine",
 ]
 
 # Pinned runtime deps (R2 / issue #3) — optional in no-GPU dev mode.

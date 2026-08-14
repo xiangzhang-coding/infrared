@@ -22,7 +22,14 @@ from torch import nn
 
 from infrared.cache.kv_cache import KVCache
 from infrared.model.config import Qwen2Config
-from infrared.model.layers import MLP, Attention, RMSNorm, RotaryEmbedding
+from infrared.model.inputs import build_attention_mask, build_positions
+from infrared.model.layers import (
+    MLP,
+    Attention,
+    ForwardContext,
+    RMSNorm,
+    RotaryEmbedding,
+)
 
 
 class DecoderLayer(nn.Module):
@@ -36,17 +43,9 @@ class DecoderLayer(nn.Module):
         self.mlp = MLP(config)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        kv_cache: KVCache,
-        layer_idx: int,
-        start_pos: int,
+        self, x: torch.Tensor, ctx: ForwardContext, layer_idx: int
     ) -> torch.Tensor:
-        attn = self.self_attn(
-            self.input_layernorm(x), cos, sin, kv_cache, layer_idx, start_pos
-        )
+        attn = self.self_attn(self.input_layernorm(x), ctx, layer_idx)
         x = x + attn
         return x + self.mlp(self.post_attention_layernorm(x))
 
@@ -62,17 +61,10 @@ class Qwen2Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        kv_cache: KVCache,
-        start_pos: int,
-    ) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, ctx: ForwardContext) -> torch.Tensor:
         h = self.embed_tokens(input_ids)
         for i, layer in enumerate(self.layers):
-            h = layer(h, cos, sin, kv_cache, i, start_pos)
+            h = layer(h, ctx, i)
         return self.norm(h)
 
 
@@ -95,24 +87,47 @@ class Qwen2ForCausalLM(nn.Module):
         return self.lm_head.weight.dtype
 
     def forward(
-        self, input_ids: torch.Tensor, kv_cache: KVCache, start_pos: int = 0
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        attn_mask: torch.Tensor,
+        kv_cache: KVCache,
+        start_col: int = 0,
     ) -> torch.Tensor:
-        """Run one forward over ``input_ids`` ``[S]`` -> logits ``[S, vocab]``.
+        """Batched forward: ``input_ids`` ``[B, S]`` -> logits ``[B, S, vocab]``.
 
-        ``start_pos`` is the absolute position of the first token, so a prefill
-        passes the whole prompt at ``start_pos=0`` and each decode step passes a
-        single token at the growing position.
+        ``positions`` ``[B, S]`` and the additive ``attn_mask`` ``[B, 1, S, T]``
+        are precomputed by the caller (``forward_single`` for one request, the
+        static-batch runner for many). ``start_col`` is the shared KV column the
+        first token of this step writes to.
         """
-        seq = input_ids.shape[0]
-        positions = torch.arange(start_pos, start_pos + seq, device=input_ids.device)
         cos, sin = self.rotary(positions)
-        h = self.model(input_ids, cos, sin, kv_cache, start_pos)
+        ctx = ForwardContext(
+            cos=cos, sin=sin, mask=attn_mask, kv_cache=kv_cache, start_col=start_col
+        )
+        h = self.model(input_ids, ctx)
         return self.lm_head(h)
 
-    def new_kv_cache(self, max_len: int) -> KVCache:
+    def forward_single(
+        self, ids: torch.Tensor, kv_cache: KVCache, start_pos: int = 0
+    ) -> torch.Tensor:
+        """Single-request convenience (B=1): ``ids`` ``[S]`` -> logits ``[S, vocab]``.
+
+        Builds the B=1 positions and a plain causal mask, so the T0 path stays a
+        one-liner on top of the batched forward.
+        """
+        seq = ids.shape[0]
+        total = start_pos + seq
+        positions = build_positions([0], start_pos, seq, ids.device)
+        mask = build_attention_mask([0], start_pos, seq, total, self.dtype, ids.device)
+        logits = self.forward(ids.unsqueeze(0), positions, mask, kv_cache, start_pos)
+        return logits[0]
+
+    def new_kv_cache(self, max_len: int, batch_size: int = 1) -> KVCache:
         """Allocate a per-request contiguous KV cache sized for this model."""
         return KVCache(
             num_layers=self.config.num_hidden_layers,
+            batch_size=batch_size,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.head_dim,
             max_len=max_len,

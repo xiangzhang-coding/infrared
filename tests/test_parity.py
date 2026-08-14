@@ -74,7 +74,7 @@ def hf_model():
 def test_first_step_logits_match_hf(infra_model, hf_model, prompt_ids) -> None:
     ids = prompt_ids
     kv = infra_model.new_kv_cache(max_len=ids.shape[0] + 1)
-    infra_logits = infra_model(ids, kv, start_pos=0)[-1]
+    infra_logits = infra_model.forward_single(ids, kv, start_pos=0)[-1]
     hf_logits = hf_model(ids.unsqueeze(0)).logits[0, -1]
 
     max_abs = (infra_logits - hf_logits).abs().max().item()
