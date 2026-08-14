@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+
+# tooling
+.claude/
+.playwright-mcp/
+
+# local-only project memory (never push)
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# model weights / HF caches — NEVER commit large binaries
+*.safetensors
+*.bin
+*.gguf
+*.pt
+models/
+.cache/
+hf_cache/
+
+# benchmark / run artifacts
+*.log
+runs/
+reports/*.local.md
