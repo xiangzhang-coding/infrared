@@ -50,9 +50,9 @@ infrared/
     model_runner.py    #   Worker seam (stub)                                 (T3+)
   engine/              # request orchestration
     static_batch.py    #   static batch: left-pad prefill + lockstep decode   (T1)
-    engine.py          #   StaticBatchEngine: request queue + worker thread   (T1)
-    scheduler.py       #   continuous-batching scheduler (stub)               (T2)
-    sequence.py        #   Sequence state machine (stub)                      (T2)
+    engine.py          #   Static + ContinuousBatch engines (busy loop)       (T1/T2)
+    scheduler.py       #   continuous-batching scheduler (waiting/running)     (T2)
+    sequence.py        #   Sequence state machine (WAITING/RUNNING/FINISHED)   (T2)
   cache/
     kv_cache.py        #   contiguous per-request KV cache (batch-first)      (T0/T1)
     block_manager.py   #   PagedAttention block manager (stub)                (T3)
@@ -121,4 +121,4 @@ The pure math (percentiles, TTFT/TPOT, goodput, knee, renderers) lives in `bench
 
 ## Status
 
-🛠️ **Building** — T0 (single-request forward, HF-parity gated) and T1 (static batching + OpenAI-compatible HTTP) are in, plus the **metrics spine** (`python -m infrared.bench`) that scores any config and drives the before→after ladder; T2 (continuous batching) is next. The plan lives as a [wayfinder map issue](https://github.com/xiangzhang-coding/infrared/issues) with build tickets. See `docs/spec/`, `docs/adr/`, and `CONTEXT.md` for the settled decisions and glossary.
+🛠️ **Building** — T0 (single-request forward, HF-parity gated), T1 (static batching + OpenAI-compatible HTTP), and **T2 (continuous batching)** are in, plus the **metrics spine** (`python -m infrared.bench`) that scores any config and stacks the `static → continuous` before→after ladder. T2's iteration-level scheduler drives batch-fill to 100% (no padding, no head-of-line waste) and streams a real TTFT; the flattened varlen batched forward — the raw-throughput lever — lands with the paged KV cache at T3. Next is T3 (paged KV block manager). The plan lives as a [wayfinder map issue](https://github.com/xiangzhang-coding/infrared/issues) with build tickets. See `docs/spec/`, `docs/adr/`, and `CONTEXT.md` for the settled decisions and glossary.

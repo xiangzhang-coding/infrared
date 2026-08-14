@@ -7,8 +7,10 @@ utilization evidence. Point ``--model`` at a local dir / HF id (e.g. the cached
 ``Qwen2.5-0.5B-Instruct``) for real weights; the workload is synthetic token ids
 within the model's vocab, so no tokenizer is needed either way.
 
-This is the unified entry the issue asks for: every future tier (T2 continuous
-batch, …) plugs the same ``measure`` call behind a different engine.
+This is the unified entry the issue asks for: it measures **T1 static batch** and
+**T2 continuous batch** on the identical model + workload + SLO and stacks them
+into the ``static → continuous`` before→after ladder — every future tier plugs
+the same ``measure`` call behind a different engine.
 """
 
 from __future__ import annotations
@@ -18,8 +20,9 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from infrared.bench.harness import measure, render_report, t0_oracle
+from infrared.bench.harness import build_ladder, measure, t0_oracle
 from infrared.bench.metrics import SLO
+from infrared.bench.report import render_sweep_markdown
 from infrared.bench.workload import Category, Workload, decode_heavy_category
 
 if TYPE_CHECKING:  # hints only — torch/model imported lazily inside the functions
@@ -114,29 +117,63 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    from infrared.engine.engine import StaticBatchEngine
+    from infrared.engine.engine import ContinuousBatchEngine, StaticBatchEngine
 
     model = _real_model(args.model) if args.model else _tiny_model()
     label = args.model or "tiny random model (CPU)"
-    engine = StaticBatchEngine(model, max_batch_size=args.max_batch, linger=0.005)
-    engine.start()
-    try:
-        rates = [float(r) for r in args.rates.split(",") if r.strip()]
-        workload = _demo_workload(model.config.vocab_size, args.seed)
-        result = measure(
-            engine,
-            oracle=t0_oracle(model),
-            workload=workload,
-            slo=SLO.from_ms(ttft_ms=args.ttft_ms, tpot_ms=args.tpot_ms),
-            rates=rates,
-            seed=args.seed,
-            notes=label,
-        )
-    finally:
-        engine.stop()
+    rates = [float(r) for r in args.rates.split(",") if r.strip()]
+    slo = SLO.from_ms(ttft_ms=args.ttft_ms, tpot_ms=args.tpot_ms)
+    workload = _demo_workload(model.config.vocab_size, args.seed)
+    oracle = t0_oracle(model)
+
+    # Measure each tier on the identical model + workload + SLO so the ladder's
+    # deltas are attributable to the *mechanism* (static vs continuous), nothing
+    # else. Both engines share the submit/Pending surface the harness drives.
+    def _measure(make_engine, tier: str, notes: str):
+        engine = make_engine().start()
+        try:
+            return measure(
+                engine,
+                oracle=oracle,
+                workload=workload,
+                slo=slo,
+                rates=rates,
+                tier=tier,
+                seed=args.seed,
+                notes=notes,
+            )
+        finally:
+            engine.stop()
+
+    t1 = _measure(
+        lambda: StaticBatchEngine(model, max_batch_size=args.max_batch, linger=0.005),
+        tier="T1 static batch",
+        notes=label,
+    )
+    t2 = _measure(
+        lambda: ContinuousBatchEngine(model, max_num_seqs=args.max_batch),
+        tier="T2 continuous batch",
+        notes=f"{label} · per-seq forward (varlen batched fwd → T3 paged KV)",
+    )
 
     print(f"# infrared metrics spine — {label}\n")
-    print(render_report(result))
+    print("## Before→after ladder\n")
+    print(build_ladder([t1, t2]))
+    print(
+        "\n> **Reading the T2 row.** Continuous batching's T2 win is **latency"
+        " (TTFT)** and **utilization**: iteration-level scheduling eliminates"
+        " static batching's prompt padding and head-of-line waste, so batch-fill"
+        " goes to 100% and p99 TTFT drops sharply (see the sweeps below).\n>"
+        " **Throughput / goodput can *regress* vs T1 here** — T2 forwards each"
+        " sequence on its own (no flattened varlen batched matmul yet), so on a"
+        " uniform burst T1's single batched GEMM is faster. The batched varlen"
+        " forward — the raw-throughput lever — lands with paged KV at **T3**; T2"
+        " deliberately isolates the *scheduling* mechanism (R1 §5, §8)."
+    )
+    print("\n## T1 static batch — knee sweep (request-rate up-scan)\n")
+    print(render_sweep_markdown(t1.sweep))
+    print("\n## T2 continuous batch — knee sweep (request-rate up-scan)\n")
+    print(render_sweep_markdown(t2.sweep))
     return 0
 
 

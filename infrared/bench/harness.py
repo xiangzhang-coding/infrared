@@ -44,9 +44,18 @@ from infrared.bench.workload import (
 )
 
 if TYPE_CHECKING:  # hints only — never imported at runtime (keeps load torch-free)
-    from infrared.engine.engine import Pending, StaticBatchEngine
+    from infrared.engine.engine import (
+        ContinuousBatchEngine,
+        ContinuousPending,
+        Pending,
+        StaticBatchEngine,
+    )
     from infrared.engine.static_batch import BatchStats
     from infrared.model.qwen2 import Qwen2ForCausalLM
+
+    # Either engine drives the harness through the same submit/Pending surface.
+    Engine = StaticBatchEngine | ContinuousBatchEngine
+    Pendings = Pending | ContinuousPending
 
 # A greedy reference: (prompt_ids, max_new_tokens) -> generated token ids.
 Oracle = Callable[[list[int], int], list[int]]
@@ -74,7 +83,7 @@ class LoadResult:
 
 
 def run_load(
-    engine: StaticBatchEngine,
+    engine: Engine,
     requests: Sequence[LoadRequest],
     arrivals: Sequence[float] | None = None,
     timeout: float = 120.0,
@@ -88,9 +97,11 @@ def run_load(
 
     Each request gets a waiter thread that stamps its completion the moment the
     engine's event fires, so a slow neighbour can't smear another request's
-    completion time. A static batch has no streaming, so ``first_token`` is set
-    to ``completion`` (faithful: static batching genuinely delivers all-or-
-    nothing — that is the pathology the knee curve exposes).
+    completion time. If the engine streams (T2 continuous batch exposes
+    ``Pending.first_token_time``), the trace's ``first_token`` is that real TTFT;
+    a static batch has no streaming, so ``first_token`` falls back to
+    ``completion`` (faithful: static batching genuinely delivers all-or-nothing —
+    the head-of-line pathology the knee curve exposes).
     """
     from infrared.engine.static_batch import BatchRequest
 
@@ -98,15 +109,25 @@ def run_load(
     if arrivals is not None and len(arrivals) != n:
         raise ValueError("arrivals must have one offset per request")
 
-    completions: list[tuple[float, int] | None] = [None] * n
+    # Drop any per-step stats left over from a prior run (e.g. the correctness
+    # A/B before this one) so this run's fill curve is scoped to this run only,
+    # regardless of call order in ``measure``.
+    if hasattr(engine, "pop_step_stats"):
+        engine.pop_step_stats()
+
+    # (completion_time, num_output_tokens, first_token_time_or_None)
+    completions: list[tuple[float, int, float | None] | None] = [None] * n
     errors: list[BaseException | None] = [None] * n
-    pendings: list[Pending | None] = [None] * n
+    pendings: list[Pendings | None] = [None] * n
     threads: list[threading.Thread] = []
 
     def wait_one(idx: int, pending: Pending) -> None:
         try:
             output = pending.result(timeout)
-            completions[idx] = (time.perf_counter(), len(output))
+            # Streaming engines stamp first_token_time before completion; static
+            # ones don't expose it -> None -> first_token collapses to completion.
+            ft = getattr(pending, "first_token_time", None)
+            completions[idx] = (time.perf_counter(), len(output), ft)
         except BaseException as exc:  # noqa: BLE001 — recorded, re-raised below
             errors[idx] = exc
 
@@ -146,26 +167,31 @@ def run_load(
         stamped = completions[i]
         if stamped is None:
             raise TimeoutError(f"request {i} did not complete within {timeout}s")
-        completion, num_tokens = stamped
+        completion, num_tokens, first_token_time = stamped
         traces.append(
             RequestTrace(
                 arrival=arrival_times[i],
-                first_token=completion,  # static batch: all-at-once
+                # Real TTFT when the engine streams; else all-at-once (static).
+                first_token=first_token_time
+                if first_token_time is not None
+                else completion,
                 completion=completion,
                 num_output_tokens=num_tokens,
                 category=req.category,
             )
         )
 
-    # Dedupe shared BatchStats (every request in a batch points at one object).
+    # Dedupe shared BatchStats (a static batch: every request points at one
+    # object). A continuous-batch engine records per-step fill instead — drain it.
     seen: dict[int, BatchStats] = {}
     for pending in pendings:
         stats = getattr(pending, "stats", None)
         if stats is not None:
             seen.setdefault(id(stats), stats)
-    return LoadResult(
-        traces=traces, wall_time=wall_time, batch_stats=list(seen.values())
-    )
+    batch_stats = list(seen.values())
+    if hasattr(engine, "pop_step_stats"):
+        batch_stats.extend(engine.pop_step_stats())
+    return LoadResult(traces=traces, wall_time=wall_time, batch_stats=batch_stats)
 
 
 def sample_gpu_util() -> float | None:
@@ -216,7 +242,7 @@ def utilization_from(batch_stats: Sequence[BatchStats]) -> Utilization:
 
 
 def check_correctness(
-    engine: StaticBatchEngine, oracle: Oracle, workload: Workload
+    engine: Engine, oracle: Oracle, workload: Workload
 ) -> CorrectnessReport:
     """A/B every prompt (greedy) against ``oracle``, tallied per category.
 
@@ -297,7 +323,7 @@ def hf_oracle(model_dir: str, dtype: str = "float32", device: str = "cpu") -> Or
     return _oracle
 
 
-def measure_throughput(engine: StaticBatchEngine, category: Category) -> float:
+def measure_throughput(engine: Engine, category: Category) -> float:
     """Sustained output tok/s on a decode-heavy burst (fixed uniform shape)."""
     requests = [
         LoadRequest(
@@ -311,7 +337,7 @@ def measure_throughput(engine: StaticBatchEngine, category: Category) -> float:
 
 
 def sweep_rates(
-    engine: StaticBatchEngine,
+    engine: Engine,
     requests: Sequence[LoadRequest],
     rates: Sequence[float],
     slo: SLO,
@@ -343,7 +369,7 @@ class MeasureResult:
 
 
 def measure(
-    engine: StaticBatchEngine,
+    engine: Engine,
     oracle: Oracle,
     workload: Workload,
     slo: SLO,
@@ -405,9 +431,10 @@ def measure(
     return MeasureResult(row=row, sweep=sweep)
 
 
-# Tiers below T1 don't exist yet; the ladder names them so the artifact reads as
+# Tiers below don't exist yet; the ladder names them so the artifact reads as
 # "one row per mechanism, filled in as it's built" rather than silently short.
-_PENDING_TIERS = ("T2 continuous batch", "T3 +paged KV", "T4 +Triton kernel")
+# T2 (continuous batch) is now built, so it drops off the pending list.
+_PENDING_TIERS = ("T3 +paged KV", "T4 +Triton kernel")
 
 
 def build_ladder(results: Sequence[MeasureResult], include_pending: bool = True) -> str:
