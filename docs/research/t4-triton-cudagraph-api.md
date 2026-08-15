@@ -133,7 +133,31 @@ def paged_decode_attn(
 
 ### 2.5 The `store_kvcache` (scatter) kernel skeleton
 
-## 3. torch CUDA graphs — capture & replay a decode step
+Before attention reads history, this step's rotated K/V must be scattered into the pool at `slot_mapping` (infrared's `write_slots`). One `@triton.jit` kernel, one program per token:
+
+```python
+@triton.jit
+def store_kvcache(
+    k_ptr, v_ptr, k_cache_ptr, v_cache_ptr, slot_mapping_ptr,
+    stride_t, stride_h, stride_d,                     # source [N, kv_heads, head_dim]
+    stride_cb, stride_ch, stride_cd,                  # cache slot strides
+    KV: tl.constexpr, HEAD_DIM: tl.constexpr,
+):
+    tok = tl.program_id(0)                            # one token per program
+    slot = tl.load(slot_mapping_ptr + tok)            # flat physical slot
+    if slot < 0:                                      # -1 = padding row, skip
+        return
+    hd = tl.arange(0, KV * HEAD_DIM)
+    k = tl.load(k_ptr + tok * stride_t + hd)          # this token's K/V
+    v = tl.load(v_ptr + tok * stride_t + hd)
+    tl.store(k_cache_ptr + slot * stride_cb + hd, k)
+    tl.store(v_cache_ptr + slot * stride_cb + hd, v)
+```
+
+- Grid: `store_kvcache[(num_tokens,)](...)`. Prefill scatters a whole prompt; decode scatters one slot per sequence. This is the Triton analogue of infrared's `PagedKVPool.write` naive scatter. [Sonar → nano-vLLM `layers/attention.py` `store_kvcache` shape]
+- `slot < 0` guard lets CUDA-graph decode pad the batch with sentinel `-1` slots (§3.4) without corrupting the pool. All calls (`tl.program_id`, `tl.load`, `tl.store`, `tl.arange`) are verified `triton.language` ops (§5).
+
+
 
 ### 3.1 Low-level `torch.cuda.CUDAGraph` + `torch.cuda.graph(...)`
 ### 3.2 `make_graphed_callables`
