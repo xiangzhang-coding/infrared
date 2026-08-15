@@ -67,6 +67,70 @@ acc = acc / l_i[:, None]                    # final normalize
 > Multiplying the scale by `1/ln2 ≈ 1.44269504` lets the kernel use hardware `exp2` instead of `exp` (a standard tutorial-06 trick). The `-inf` masking + running-max subtraction is exactly the numerical-stability guarantee the ticket asks for. [Sonar → triton-lang.org tutorial 06]
 
 
+### 2.4 Minimal GPU-compilable paged-attn kernel skeleton
+
+**Shape, not copy (ADR-0004).** Every API call below is a real, verified primitive (§5); the *assembly* is illustrative and must be `triton.jit`-compiled + parity-tested on a GPU. Matches infrared's seam (`PagedKVPool` flat `[layers, num_blocks*block_size, kv_heads, head_dim]`, `write_slots`=slot_mapping, per-row history via `block_table`).
+
+```python
+import triton
+import triton.language as tl
+
+@triton.jit
+def paged_decode_attn(
+    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr,          # tensors
+    block_tables_ptr, context_lens_ptr,              # paged metadata
+    scale,
+    stride_qs, stride_qh, stride_qd,                 # q strides (row-major)
+    stride_kb, stride_kh, stride_kd,                 # k/v cache slot strides
+    stride_bt_s, stride_bt_b,                        # block_tables strides
+    HEAD_DIM: tl.constexpr, BLOCK_SIZE: tl.constexpr, MAX_BLOCKS: tl.constexpr,
+):
+    seq = tl.program_id(0)                            # one program per (seq, head)
+    head = tl.program_id(1)
+    ctx_len = tl.load(context_lens_ptr + seq)         # how much history is valid
+
+    # load this seq/head's single decode query row -> [HEAD_DIM]
+    d = tl.arange(0, HEAD_DIM)
+    q = tl.load(q_ptr + seq * stride_qs + head * stride_qh + d * stride_qd)
+    qk_scale = scale * 1.44269504                      # 1/ln2 -> use exp2
+
+    m_i = -float("inf"); l_i = 0.0
+    acc = tl.zeros([HEAD_DIM], tl.float32)
+
+    for blk in range(MAX_BLOCKS):
+        blk_start = blk * BLOCK_SIZE
+        # block_table[seq, blk] -> physical block id -> flat slot base
+        phys = tl.load(block_tables_ptr + seq * stride_bt_s + blk * stride_bt_b)
+        slots = tl.arange(0, BLOCK_SIZE)
+        tok_pos = blk_start + slots
+        valid = tok_pos < ctx_len                      # mask past real context
+        slot_base = phys * BLOCK_SIZE + slots          # flat physical rows
+
+        # gather K/V tile for this physical block (masked, non-contiguous)
+        k = tl.load(k_cache_ptr + (slot_base[:, None] * stride_kb
+                    + head * stride_kh + d[None, :] * stride_kd),
+                    mask=valid[:, None], other=0.0)     # [BLOCK_SIZE, HEAD_DIM]
+        v = tl.load(v_cache_ptr + (slot_base[:, None] * stride_kb
+                    + head * stride_kh + d[None, :] * stride_kd),
+                    mask=valid[:, None], other=0.0)
+
+        qk = tl.sum(q[None, :] * k, axis=1) * qk_scale  # [BLOCK_SIZE] scores
+        qk = tl.where(valid, qk, -float("inf"))
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=0))
+        p = tl.math.exp2(qk - m_ij)                     # [BLOCK_SIZE]
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        m_i = m_ij
+
+    acc = acc / l_i
+    tl.store(o_ptr + seq * stride_qs + head * stride_qh + d * stride_qd, acc)
+```
+
+- Grid: `paged_decode_attn[(num_seqs, num_heads)](...)`. For long contexts, add a 3rd `program_id` axis to split the block loop into partitions (vLLM's `max_num_partitions`) and combine partials — deferred; the single-program loop above is the minimal correct shape. [Sonar → docs.vllm.ai paged_attention]
+- GQA: map `head` → `kv_head = head // n_rep` when indexing K/V. (infrared already does `repeat_kv`; the kernel folds it into the index.)
+- Uses `tl.sum(q*k)` rather than `tl.dot` because decode has a single query row (a mat-vec); a **prefill** kernel with `BLOCK_M>1` query rows uses `tl.dot(q, k)` per §2.3. Both `tl.sum` and `tl.dot` are verified `triton.language` ops.
+
 ### 2.5 The `store_kvcache` (scatter) kernel skeleton
 
 ## 3. torch CUDA graphs — capture & replay a decode step
