@@ -296,6 +296,12 @@ Both surfaces are **GPU-only**; infrared keeps a naive PyTorch attention fallbac
 
 ## 6. What I could NOT verify (honest gaps)
 
+1. **Exact triton version for torch 2.12.0** — not confirmed from any first-party source (§1). A third-party wheel showed `triton 3.7.0`; treat as a hint only. **Do not pin; read `pip show triton` on the GPU box.** (R2 fabricated `3.7.1` here — do not repeat.)
+2. **Per-symbol "added-in-version" lines** — Context7/Sonar serve `main` docs. Every API is verified to *exist*, but I did not diff each symbol against the torch 2.12.0 / the resolved-triton changelogs. All are long-standing (`CUDAGraph` since torch 1.10; `make_block_ptr`/online-softmax are core Triton), so low risk, but not line-by-line version-pinned.
+3. **`torch.cuda.graph_pool_handle()`** — real documented helper, but I verified only the `g.pool()` / `pool=` / `MemPool` / `use_mem_pool` forms via Context7. Confirm the standalone helper before relying on it.
+4. **The kernel skeletons are SHAPE, not tested code (ADR-0004).** Every *call* is a verified primitive, but the assembled `paged_decode_attn` / `store_kvcache` were **not compiled or numerically checked** — strides, GQA head mapping, and the `-inf`/mask edges must be validated against the naive fallback (HF parity) on a GPU when T4c implements them.
+5. **vLLM/nano-vLLM specifics are design-level.** Grid layout, bucketing, and pool-sharing come from vLLM docs + walkthroughs (Sonar), not a line-by-line read of a pinned vLLM commit. Shapes are right; exact vLLM function signatures were intentionally not copied (ADR-0004).
+
 ---
 
 _↩ Back to tracking issue: [infrared#10 — R3 · Research: Triton paged-attn kernel API + torch CUDA graphs API](https://github.com/xiangzhang-coding/infrared/issues/10)_
