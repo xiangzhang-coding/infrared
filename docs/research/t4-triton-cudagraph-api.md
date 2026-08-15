@@ -197,6 +197,25 @@ out = graphed(real_input)   # forward runs as a graph
 > For infrared's decode (inference-only, no autograd), the **low-level `CUDAGraph` + explicit static buffers** (§3.1/§3.4) gives more control over the paged metadata than `make_graphed_callables`; the latter is the quick path when a plain module just needs graphing.
 
 ### 3.3 Static-input-buffer constraints + warmup
+
+Verified constraints [Context7 `/pytorch/pytorch` notes/cuda.md]:
+
+1. **Warmup before capture, on a side stream.** Run the workload a few times so lazy allocations / autotuning settle, then capture. Required pattern:
+   ```python
+   s = torch.cuda.Stream()
+   s.wait_stream(torch.cuda.current_stream())
+   with torch.cuda.stream(s):
+       for _ in range(3):
+           _ = model(static_in)          # warmup
+   torch.cuda.current_stream().wait_stream(s)
+   with torch.cuda.graph(g):
+       static_out = model(static_in)     # capture
+   ```
+2. **Fixed shapes + fixed addresses.** Every captured tensor's shape and allocation must be identical at replay. Keep long-lived references to the static in/out buffers.
+3. **No new allocations inside the captured region.** Model params + KV cache must already be resident; the graph captures their *use*, not fresh allocs.
+4. **No data-dependent shapes/control-flow.** You may branch on values, but shapes must not change; mask padded rows via data, not by reshaping.
+5. **Multi-stream rule.** Any side stream used *inside* capture must branch from and rejoin the initial capture stream (`s.wait_stream(...)` / `current_stream().wait_stream(s)`), or capture is rejected.
+
 ### 3.4 Variable-length / paged batches under graphs
 
 ## 4. Linux/CUDA-only compat notes (lazy import, no CPU path)
