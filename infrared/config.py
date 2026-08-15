@@ -30,6 +30,11 @@ class EngineConfig:
     # KV paging (T3).
     block_size: int = 16
 
+    # Prefix caching (T4): share a request's cached prompt-prefix KV blocks with
+    # later requests that repeat the prefix (system prompt / few-shot). A pure
+    # no-op when nothing is shared; see ``engine/paged_engine.py``.
+    enable_prefix_caching: bool = True
+
     # Continuous-batching budgets (T2).
     max_num_seqs: int = 256
     max_num_batched_tokens: int = 8192

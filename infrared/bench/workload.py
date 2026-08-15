@@ -68,6 +68,36 @@ def decode_heavy_category(
     return Category(name="decode-heavy", prompts=prompts, max_new_tokens=max_new_tokens)
 
 
+def shared_prefix_category(
+    n: int,
+    prefix_len: int = 32,
+    tail_len: int = 4,
+    max_new_tokens: int = 16,
+    vocab_size: int = 1000,
+    seed: int = 0,
+) -> Category:
+    """``n`` prompts that all begin with the *same* prefix, then a distinct tail.
+
+    This is the shape prefix caching (T4) is built for — a shared system prompt /
+    few-shot preamble across many requests. ``prefix_len`` should span at least
+    one full KV block for reuse to trigger (the cache addresses whole blocks); the
+    per-prompt ``tail_len`` differs so the requests aren't identical. Token ids are
+    drawn deterministically in ``[1, vocab_size)`` (0 is the static-batch pad id)
+    so runs reproduce; the shared prefix is drawn once, the tails per prompt.
+    """
+    if n <= 0 or prefix_len <= 0 or tail_len < 0:
+        raise ValueError("n and prefix_len must be positive; tail_len non-negative")
+    rng = random.Random(seed)
+    prefix = [rng.randrange(1, vocab_size) for _ in range(prefix_len)]
+    prompts = [
+        prefix + [rng.randrange(1, vocab_size) for _ in range(tail_len)]
+        for _ in range(n)
+    ]
+    return Category(
+        name="shared-prefix", prompts=prompts, max_new_tokens=max_new_tokens
+    )
+
+
 def poisson_arrivals(rate: float, n: int, seed: int = 0) -> list[float]:
     """Cumulative arrival offsets (seconds) for a rate-``rate`` Poisson process.
 

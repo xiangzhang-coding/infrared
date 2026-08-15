@@ -23,7 +23,12 @@ from typing import TYPE_CHECKING
 from infrared.bench.harness import build_ladder, measure, t0_oracle
 from infrared.bench.metrics import SLO
 from infrared.bench.report import render_sweep_markdown
-from infrared.bench.workload import Category, Workload, decode_heavy_category
+from infrared.bench.workload import (
+    Category,
+    Workload,
+    decode_heavy_category,
+    shared_prefix_category,
+)
 
 if TYPE_CHECKING:  # hints only — torch/model imported lazily inside the functions
     from infrared.model.qwen2 import Qwen2ForCausalLM
@@ -73,18 +78,32 @@ def _real_model(model_ref: str) -> Qwen2ForCausalLM:
     )
 
 
-def _demo_workload(vocab_size: int, seed: int) -> Workload:
-    """A small mixed workload within the model's vocab (token ids, no tokenizer)."""
+def _demo_workload(vocab_size: int, seed: int, block_size: int) -> Workload:
+    """A small mixed workload within the model's vocab (token ids, no tokenizer).
+
+    Includes a **shared-prefix** category (many prompts, one common preamble
+    spanning ≥1 KV block) so the +prefix-caching tier has something to reuse; the
+    prefix is sized to ``block_size`` so at least one whole block is cacheable.
+    """
     short = decode_heavy_category(
         n=4, prompt_len=4, max_new_tokens=8, vocab_size=vocab_size, seed=seed
     )
     long = decode_heavy_category(
         n=2, prompt_len=8, max_new_tokens=24, vocab_size=vocab_size, seed=seed + 1
     )
+    shared = shared_prefix_category(
+        n=4,
+        prefix_len=2 * block_size,
+        tail_len=4,
+        max_new_tokens=16,
+        vocab_size=vocab_size,
+        seed=seed + 2,
+    )
     return Workload(
         categories=[
             Category(name="short", prompts=short.prompts, max_new_tokens=8),
             Category(name="long", prompts=long.prompts, max_new_tokens=24),
+            shared,
         ]
     )
 
@@ -130,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     label = args.model or "tiny random model (CPU)"
     rates = [float(r) for r in args.rates.split(",") if r.strip()]
     slo = SLO.from_ms(ttft_ms=args.ttft_ms, tpot_ms=args.tpot_ms)
-    workload = _demo_workload(model.config.vocab_size, args.seed)
+    workload = _demo_workload(model.config.vocab_size, args.seed, args.block_size)
     oracle = t0_oracle(model)
 
     # Measure each tier on the identical model + workload + SLO so the ladder's
@@ -168,14 +187,44 @@ def main(argv: list[str] | None = None) -> int:
             max_num_seqs=args.max_batch,
             block_size=args.block_size,
             num_blocks=args.num_blocks,
+            enable_prefix_caching=False,  # pure paging — the T4 row adds caching
         ),
         tier="T3 +paged KV",
         notes=f"{label} · paged {args.num_blocks}×{args.block_size} · batched decode",
     )
 
+    # T4: same paged engine, prefix caching on. Keep the engine handle so its
+    # reuse counters (physical blocks / prompt tokens served from cache) can go
+    # into the row — the observable "it actually reused" evidence.
+    t4_engine = PagedBatchEngine(
+        model,
+        max_num_seqs=args.max_batch,
+        block_size=args.block_size,
+        num_blocks=args.num_blocks,
+        enable_prefix_caching=True,
+    ).start()
+    try:
+        t4 = measure(
+            t4_engine,
+            oracle=oracle,
+            workload=workload,
+            slo=slo,
+            rates=rates,
+            tier="T4 +prefix caching",
+            seed=args.seed,
+            notes="",
+        )
+    finally:
+        t4_engine.stop()
+    t4.row.notes = (
+        f"{label} · reused {t4_engine.prefix_reused_blocks} prefix blocks "
+        f"({t4_engine.prefix_reused_tokens} tok, engine-lifetime total) on "
+        f"shared-prefix workload"
+    )
+
     print(f"# infrared metrics spine — {label}\n")
     print("## Before→after ladder\n")
-    print(build_ladder([t1, t2, t3]))
+    print(build_ladder([t1, t2, t3, t4]))
     print(
         "\n> **Reading the ladder.** **T2** (continuous batch) removes static"
         " batching's prompt padding + head-of-line waste (batch-fill → 100%) and"
@@ -186,8 +235,12 @@ def main(argv: list[str] | None = None) -> int:
         " (on-demand fixed-size blocks, no worst-case reservation, no"
         " fragmentation); the **throughput/goodput** gain over T2 is attributable"
         " to *batched decode* (one matmul across the running set), which paging"
-        " enables. The Triton paged-attn kernel that fuses the gather is T4 (R1"
-        " §5, §8)."
+        " enables. **T4** (+prefix caching) reuses shared prompt-prefix KV blocks"
+        " across requests (see the reused-blocks note): the win shows on"
+        " shared-prefix workloads (system prompt / few-shot) as skipped prefill"
+        " compute + fewer blocks held; it is a no-op when prompts share nothing."
+        " The Triton paged-attn kernel that fuses the gather is still T4-remaining"
+        " (R1 §5, §8)."
     )
     print("\n## T1 static batch — knee sweep (request-rate up-scan)\n")
     print(render_sweep_markdown(t1.sweep))
@@ -195,6 +248,8 @@ def main(argv: list[str] | None = None) -> int:
     print(render_sweep_markdown(t2.sweep))
     print("\n## T3 +paged KV — knee sweep (request-rate up-scan)\n")
     print(render_sweep_markdown(t3.sweep))
+    print("\n## T4 +prefix caching — knee sweep (request-rate up-scan)\n")
+    print(render_sweep_markdown(t4.sweep))
     return 0
 
 

@@ -11,6 +11,7 @@ from infrared.bench.workload import (
     Workload,
     decode_heavy_category,
     poisson_arrivals,
+    shared_prefix_category,
 )
 
 
@@ -70,3 +71,22 @@ def test_workload_items_flattens_categories() -> None:
     assert items[0] == ("short", [1, 2], 8)
     assert items[-1] == ("long", [5], 16)
     assert wl.num_requests == 3
+
+
+def test_shared_prefix_category_shares_a_deterministic_prefix() -> None:
+    cat = shared_prefix_category(
+        n=4, prefix_len=8, tail_len=3, max_new_tokens=16, vocab_size=64, seed=0
+    )
+    assert cat.name == "shared-prefix"
+    assert len(cat.prompts) == 4
+    prefix = cat.prompts[0][:8]
+    # Every prompt begins with the identical prefix, then a distinct tail.
+    assert all(p[:8] == prefix for p in cat.prompts)
+    assert all(len(p) == 11 for p in cat.prompts)
+    tails = [tuple(p[8:]) for p in cat.prompts]
+    assert len(set(tails)) > 1  # tails are not all identical
+    # Same seed reproduces the exact prompts.
+    again = shared_prefix_category(
+        n=4, prefix_len=8, tail_len=3, max_new_tokens=16, vocab_size=64, seed=0
+    )
+    assert cat.prompts == again.prompts

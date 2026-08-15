@@ -1,4 +1,4 @@
-"""Paged continuous-batching engine (T3) — PagedAttention + batched decode.
+"""Paged continuous-batching engine (T3) + prefix caching (T4) — PagedAttention.
 
 Extends the T2 ``ContinuousBatchEngine`` with a paged KV backend, keeping the
 same submit/``Pending`` surface and busy loop. Two things change:
@@ -12,16 +12,25 @@ same submit/``Pending`` surface and busy loop. Two things change:
    in one forward — each sequence's ragged history is gathered from its block
    table (``PagedKVPool.gather``), padded, and masked per-sequence. This is the
    throughput lever T2 deferred: one batched matmul instead of a per-sequence
-   loop. (Prefill stays one sequence per step; chunked/flattened-varlen prefill
-   and the Triton paged-attn kernel are T4 — R1 §5/§8.)
+   loop. (The Triton paged-attn kernel that fuses the gather is T4 — R1 §5/§8.)
+
+**Prefix caching (T4, ``enable_prefix_caching``).** When two requests share a
+prompt prefix (a system prompt / few-shot preamble), the second reuses the first's
+already-computed KV blocks instead of reallocating and recomputing them:
+``_prefill`` calls ``BlockManager.match_prefix`` to claim the cached prefix blocks
+(ref-counted up) and then forwards **only the un-cached suffix** — a partial
+prefill whose queries attend back over the full history. Output stays
+bit-identical (the prefix hash chain guarantees the reused KV is exactly this
+prompt's prefix; §_prefill). It is a pure no-op when nothing is shared.
 
 When the pool can't grant a block mid-decode, a **recompute preemption** evicts
 the newest running sequence (frees its blocks, returns it to the waiting head);
 when re-admitted it re-prefills its ``token_ids`` (prompt + tokens generated so
-far), so no output is lost — just recomputed. Greedy output stays token-for-token
-identical to the T0 oracle: the paged read/write reproduces each sequence's exact
-history, and batched decode is just independent per-sequence attentions masked
-apart (validated in tests/test_paged_kv.py).
+far) — re-hitting any still-cached prefix — so no output is lost, just recomputed.
+Greedy output stays token-for-token identical to the T0 oracle: the paged
+read/write reproduces each sequence's exact history, and batched decode is just
+independent per-sequence attentions masked apart (validated in
+tests/test_paged_kv.py).
 """
 
 from __future__ import annotations
@@ -46,9 +55,15 @@ class PagedBatchEngine(ContinuousBatchEngine):
         max_num_seqs: int = 8,
         block_size: int = 16,
         num_blocks: int = 256,
+        enable_prefix_caching: bool = True,
     ) -> None:
         super().__init__(model, max_num_seqs=max_num_seqs)
         self.block_size = block_size
+        self.enable_prefix_caching = enable_prefix_caching
+        # Observable reuse evidence (the T4 win): how many physical prefix blocks
+        # / prompt tokens were served from cache instead of allocated + computed.
+        self.prefix_reused_blocks = 0
+        self.prefix_reused_tokens = 0
         self.block_manager = BlockManager(num_blocks=num_blocks, block_size=block_size)
         self.pool = PagedKVPool(
             num_layers=model.config.num_hidden_layers,
@@ -70,7 +85,14 @@ class PagedBatchEngine(ContinuousBatchEngine):
         # more sequences share the pool than T2's contiguous reservation would.
         if sched.waiting and len(sched.running) < self.max_num_seqs:
             seq = sched.waiting[0]
-            need = self.block_manager.blocks_for(len(seq.token_ids))
+            # Prefix-aware admission: a shared prefix already resident in the pool
+            # (held by a live sequence) costs no new blocks, so credit it here —
+            # otherwise the whole-prompt block count would defer a request the pool
+            # could actually house (the occupancy win, claimed at admission too).
+            if self.enable_prefix_caching:
+                need = self.block_manager.blocks_needed_with_prefix(seq.token_ids)
+            else:
+                need = self.block_manager.blocks_for(len(seq.token_ids))
             if self.block_manager.num_free_blocks >= need:
                 sched.waiting.popleft()
                 seq.status = SequenceStatus.RUNNING
@@ -90,25 +112,47 @@ class PagedBatchEngine(ContinuousBatchEngine):
             self._decode_step()
 
     def _prefill(self, seq: Sequence) -> None:
-        """Allocate blocks, run one paged prefill over ``token_ids``, sample."""
+        """Reuse any cached prefix, prefill only the un-cached suffix, sample.
+
+        With prefix caching, a shared prompt prefix (system prompt / few-shot) is
+        served from blocks a prior request already computed: ``match_prefix``
+        hands back those physical blocks (ref-counted up) and the count of cached
+        tokens, so this forward runs over **only** ``token_ids[num_cached:]``. The
+        reused prefix's K/V already sits in the pool; the suffix attends back over
+        the full ``[0:length]`` history (gather), writes only its own slots, and
+        RoPE positions resume at ``num_cached`` — so the result is bit-identical to
+        prefilling the whole prompt (Seam A holds; the prefix hash chain guarantees
+        the reused KV is exactly this prompt's prefix). The match is capped below
+        ``length`` so there is always ≥1 suffix token to produce the first logits.
+        Freshly-computed full blocks are then published for downstream reuse.
+        """
         if seq.seed is not None and seq.generator is None:
             seq.generator = torch.Generator(device=self.model.device).manual_seed(
                 seq.seed
             )
         length = len(seq.token_ids)
-        seq.block_table = self.block_manager.allocate(length)
+        if self.enable_prefix_caching:
+            reused, num_cached = self.block_manager.match_prefix(seq.token_ids)
+        else:
+            reused, num_cached = [], 0
         try:
+            total_blocks = self.block_manager.blocks_for(length)
+            new_blocks = self.block_manager.allocate_new(total_blocks - len(reused))
+            seq.block_table = reused + new_blocks
+            q_len = length - num_cached  # only the un-cached suffix is forwarded
             write_slots = self._slots(
-                [self._slot(seq.block_table, p) for p in range(length)]
+                [self._slot(seq.block_table, p) for p in range(num_cached, length)]
             )
-            gather_slots = write_slots.reshape(1, length)
-            positions = build_positions([0], 0, length, self.model.device)
+            gather_slots = self._slots(
+                [self._slot(seq.block_table, p) for p in range(length)]
+            ).reshape(1, length)
+            positions = build_positions([0], num_cached, q_len, self.model.device)
             mask = build_attention_mask(
-                [0], 0, length, length, self.model.dtype, self.model.device
+                [0], num_cached, q_len, length, self.model.dtype, self.model.device
             )
             ids = torch.tensor(
-                seq.token_ids, dtype=torch.long, device=self.model.device
-            ).reshape(1, length)
+                seq.token_ids[num_cached:], dtype=torch.long, device=self.model.device
+            ).reshape(1, q_len)
             logits = self.model.forward(
                 ids,
                 positions,
@@ -116,7 +160,13 @@ class PagedBatchEngine(ContinuousBatchEngine):
                 paged=PagedContext(self.pool, write_slots, gather_slots),
             )
             seq.num_cached_tokens = length
+            if self.enable_prefix_caching:
+                # Now that this prompt's KV is in the pool, make its full blocks
+                # reusable by the next request that shares the prefix.
+                self.block_manager.register_full_blocks(seq.block_table, seq.token_ids)
             token = self.sampler.sample(logits[0, -1], seq.temperature, seq.generator)
+            self.prefix_reused_blocks += len(reused)
+            self.prefix_reused_tokens += num_cached
             self._postprocess(seq, token)
         except Exception as exc:  # noqa: BLE001 — isolate: fail just this request
             # A single-sequence prefill can fail on its own (e.g. an out-of-vocab
