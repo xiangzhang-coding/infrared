@@ -112,6 +112,10 @@ class PagedBatchEngine(ContinuousBatchEngine):
         self.chunk_size = chunk_size
         self.token_budget = max_num_batched_tokens or (max_num_seqs + chunk_size)
         self.mixed_steps = 0
+        # Observable evidence that recompute preemption actually fired (like
+        # ``mixed_steps`` / ``prefix_reused_blocks``): the number of sequences
+        # evicted under block pressure and requeued for recompute.
+        self.preemptions = 0
         self.block_manager = BlockManager(num_blocks=num_blocks, block_size=block_size)
         self.pool = PagedKVPool(
             num_layers=model.config.num_hidden_layers,
@@ -584,6 +588,14 @@ class PagedBatchEngine(ContinuousBatchEngine):
         victim.num_cached_tokens = (
             0  # -> needs_prefill; re-prefills token_ids on return
         )
+        # Restore target = the full known context (prompt + tokens generated so
+        # far), not just the prompt: on recompute the chunked path must re-prefill
+        # every token in ``token_ids`` before decode resumes, else the generated
+        # suffix's KV is never rebuilt and the output tail duplicates/shifts. Fresh
+        # sequences keep ``prefill_len == num_prompt_tokens``; the non-chunked
+        # ``_prefill`` already re-prefills ``len(token_ids)`` directly.
+        victim.prefill_len = len(victim.token_ids)
+        self.preemptions += 1
         self.scheduler.running.remove(victim)
         victim.status = SequenceStatus.WAITING
         self.scheduler.waiting.appendleft(victim)

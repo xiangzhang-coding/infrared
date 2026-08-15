@@ -123,7 +123,7 @@ def plan_mixed_step(
         take = min(chunk_size, seq.num_prefill_remaining, prefill_budget)
         if take <= 0:
             continue
-        completes = seq.num_cached_tokens + take == seq.num_prompt_tokens
+        completes = seq.num_cached_tokens + take == seq.prefill_len
         chunks.append(
             SeqChunk(
                 seq,

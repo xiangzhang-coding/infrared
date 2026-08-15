@@ -297,3 +297,60 @@ def test_long_prefill_interleaves_with_decode() -> None:
     # Structural evidence (non-flaky): at least one step carried a prefill chunk of
     # the long prompt together with a decode of a short request.
     assert engine.mixed_steps > 0
+
+
+# --- Regression (T4b bug): preemption of a *decoding* sequence under chunked ---
+# The tiny random model above collapses to a constant greedy token, which hides
+# token duplication/shift under recompute. Use the real 0.5B (gated, like the
+# parity tests) so distinct greedy tokens make any divergence visible.
+
+
+def _cached_qwen05b() -> str | None:
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download("Qwen/Qwen2.5-0.5B-Instruct", local_files_only=True)
+    except Exception:
+        return None
+
+
+_Q05B = _cached_qwen05b()
+
+
+@pytest.mark.skipif(_Q05B is None, reason="Qwen2.5-0.5B-Instruct not cached")
+def test_chunked_preemption_of_decoding_seq_matches_oracle_real_model() -> None:
+    """Seam A under the T4b bug's exact trigger.
+
+    A *decoding* sequence is recompute-preempted while chunked prefill is on; a
+    tight block pool forces eviction. Every request must still match the T0 oracle
+    token-for-token. Regression for the chunked recompute anchoring the prefill
+    boundary at ``num_prompt_tokens`` (dropping the generated suffix's KV) instead
+    of ``len(token_ids)``.
+    """
+    import torch
+
+    from infrared.model.qwen2 import Qwen2ForCausalLM
+
+    model = Qwen2ForCausalLM.from_pretrained(_Q05B, dtype=torch.float32, device="cpu")
+    # Short distinct prompts + a decode budget that pushes each past a block
+    # boundary; a small pool then forces preemption while some are decoding.
+    items = [
+        ([1, 2, 3, 4, 5, 6], 8),
+        ([40, 41, 42, 43], 8),
+        ([100, 200, 300, 400, 500], 8),
+        ([7, 8, 9], 8),
+    ]
+    engine, outputs = _run(
+        model,
+        items,
+        max_num_seqs=4,
+        block_size=8,
+        num_blocks=5,
+        chunk_size=3,
+    )
+    assert engine.preemptions > 0, "config did not force preemption — bug not exercised"
+    for (prompt, m), out in zip(items, outputs, strict=True):
+        assert out == _oracle(model, prompt, m), (
+            "chunked+preemption diverged from oracle"
+        )
+    assert engine.block_manager.num_used_blocks == 0

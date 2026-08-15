@@ -70,6 +70,11 @@ class Sequence:
     # Filled at construction from ``prompt_ids``; grows as tokens are generated.
     token_ids: list[int] = field(init=False)
     num_prompt_tokens: int = field(init=False)
+    # How many leading tokens must be prefilled before decoding (re)starts. Equals
+    # ``num_prompt_tokens`` for a fresh request; a recompute preemption of a
+    # *decoding* sequence raises it to ``len(token_ids)`` so the generated suffix's
+    # KV is rebuilt too. Chunked prefill reads this, not ``num_prompt_tokens``.
+    prefill_len: int = field(init=False)
     generated: list[int] = field(init=False, default_factory=list)
 
     # Logical→physical KV mapping (T3 paged engine). Empty for the T2 contiguous
@@ -85,6 +90,7 @@ class Sequence:
             raise ValueError("Sequence requires a non-empty prompt")
         self.token_ids = list(self.prompt_ids)
         self.num_prompt_tokens = len(self.prompt_ids)
+        self.prefill_len = self.num_prompt_tokens
 
     @property
     def needs_prefill(self) -> bool:
@@ -93,20 +99,23 @@ class Sequence:
 
     @property
     def is_prefilling(self) -> bool:
-        """True while the prompt is only partially in the KV cache (T4 chunked prefill).
+        """True while the (re)prefill target is only partially in the KV cache.
 
         ``needs_prefill`` (``== 0``) is the narrower "not started / preempted and
         reset" edge; ``is_prefilling`` covers the whole span a chunked prefill is
-        mid-flight — ``0 <= num_cached_tokens < num_prompt_tokens`` — i.e. this
-        sequence still owes prefill work and is not yet decoding. Once the last
-        chunk lands (``num_cached_tokens == num_prompt_tokens``) it flips to decode.
+        mid-flight — ``0 <= num_cached_tokens < prefill_len`` — i.e. this sequence
+        still owes prefill work and is not yet decoding. ``prefill_len`` is
+        ``num_prompt_tokens`` for a fresh request, or ``len(token_ids)`` after a
+        decoding sequence is recompute-preempted (so its generated suffix is
+        rebuilt). Once the last chunk lands (``num_cached_tokens == prefill_len``)
+        it flips to decode.
         """
-        return self.num_cached_tokens < self.num_prompt_tokens
+        return self.num_cached_tokens < self.prefill_len
 
     @property
     def num_prefill_remaining(self) -> int:
-        """Prompt tokens not yet prefilled (0 once decoding). The chunk-size cap."""
-        return max(self.num_prompt_tokens - self.num_cached_tokens, 0)
+        """Prefill-target tokens not yet cached (0 once decoding); the chunk cap."""
+        return max(self.prefill_len - self.num_cached_tokens, 0)
 
     @property
     def last_token(self) -> int:
