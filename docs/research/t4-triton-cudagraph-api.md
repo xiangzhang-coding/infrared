@@ -22,7 +22,13 @@
 ## 2. Triton paged-attention kernel — the real API
 
 ### 2.1 Decorators / launch / program id
-### 2.2 Loads, stores, block pointers, masking
+
+- **`@triton.jit`** — decorator that compiles a Python fn into a GPU kernel. `constexpr` params are compile-time (tile sizes). [Context7 `/triton-lang/triton`, `docs/python-api/triton.rst`]
+- **`tl.program_id(axis=0|1|2)`** / **`tl.num_programs(axis)`** — this program's coordinate in the launch grid. Paged-attn grids over `(head, seq, [q_block])`; vLLM documents the decode grid as `(num_heads, num_seqs, max_num_partitions)`. [Context7 test_bindings.py; Sonar → docs.vllm.ai paged_attention]
+- **Launch / grid** — call the kernel as `kernel[grid](args..., BLOCK=..., num_warps=..., num_stages=...)` where `grid` is a tuple (or a lambda of `meta`). Kernels return nothing; they write via output pointers. [Context7 `/triton-lang/triton`]
+- **`tl.constexpr`** — annotate tile sizes / compile-time constants; math constants (e.g. `log2e: tl.constexpr = 1.44269504`) must be assigned to a `constexpr` var inside the kernel. [Context7 test_bindings.py]
+
+
 ### 2.3 `tl.dot` + numerically-stable online softmax
 ### 2.4 Minimal GPU-compilable paged-attn kernel skeleton
 ### 2.5 The `store_kvcache` (scatter) kernel skeleton
