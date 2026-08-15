@@ -98,6 +98,29 @@ def shared_prefix_category(
     )
 
 
+def long_prefill_category(
+    n: int = 2,
+    prompt_len: int = 48,
+    max_new_tokens: int = 16,
+    vocab_size: int = 1000,
+    seed: int = 0,
+) -> Category:
+    """Long prompts (many prefill blocks) — the shape chunked prefill (T4b) targets.
+
+    A long prompt's prefill would, un-chunked, occupy the engine for one big step
+    and stall concurrent decodes; chunked prefill spreads it across steps. Sized so
+    ``prompt_len`` spans several KV blocks / chunks. Token ids are drawn
+    deterministically in ``[1, vocab_size)`` (0 is the static-batch pad id).
+    """
+    if n <= 0 or prompt_len <= 0:
+        raise ValueError("n and prompt_len must be positive")
+    rng = random.Random(seed)
+    prompts = [
+        [rng.randrange(1, vocab_size) for _ in range(prompt_len)] for _ in range(n)
+    ]
+    return Category(name="long-prefill", prompts=prompts, max_new_tokens=max_new_tokens)
+
+
 def poisson_arrivals(rate: float, n: int, seed: int = 0) -> list[float]:
     """Cumulative arrival offsets (seconds) for a rate-``rate`` Poisson process.
 

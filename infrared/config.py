@@ -35,6 +35,12 @@ class EngineConfig:
     # no-op when nothing is shared; see ``engine/paged_engine.py``.
     enable_prefix_caching: bool = True
 
+    # Chunked prefill (T4): split a long prefill into ``chunk_size``-token chunks
+    # and mix them with decode within one step (bounded by ``max_num_batched_tokens``)
+    # so a long prompt no longer blocks the decode queue. Off by default.
+    enable_chunked_prefill: bool = False
+    chunk_size: int = 512
+
     # Continuous-batching budgets (T2).
     max_num_seqs: int = 256
     max_num_batched_tokens: int = 8192

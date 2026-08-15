@@ -92,6 +92,23 @@ class Sequence:
         return self.num_cached_tokens == 0
 
     @property
+    def is_prefilling(self) -> bool:
+        """True while the prompt is only partially in the KV cache (T4 chunked prefill).
+
+        ``needs_prefill`` (``== 0``) is the narrower "not started / preempted and
+        reset" edge; ``is_prefilling`` covers the whole span a chunked prefill is
+        mid-flight — ``0 <= num_cached_tokens < num_prompt_tokens`` — i.e. this
+        sequence still owes prefill work and is not yet decoding. Once the last
+        chunk lands (``num_cached_tokens == num_prompt_tokens``) it flips to decode.
+        """
+        return self.num_cached_tokens < self.num_prompt_tokens
+
+    @property
+    def num_prefill_remaining(self) -> int:
+        """Prompt tokens not yet prefilled (0 once decoding). The chunk-size cap."""
+        return max(self.num_prompt_tokens - self.num_cached_tokens, 0)
+
+    @property
     def last_token(self) -> int:
         """The most recent token — the single id a decode step forwards."""
         return self.token_ids[-1]

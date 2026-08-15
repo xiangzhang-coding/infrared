@@ -52,3 +52,34 @@ def build_attention_mask(
 
     mask = torch.zeros(len(pad_lens), 1, q_len, total_k, dtype=dtype, device=device)
     return mask.masked_fill(~allowed[:, None, :, :], torch.finfo(dtype).min)
+
+
+def build_varlen_mask(
+    q_seq_ids: torch.Tensor,
+    q_pos: torch.Tensor,
+    k_seq_ids: torch.Tensor,
+    k_pos: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Additive mask ``[1, 1, Q, K]`` for a **flattened** multi-sequence frame (T4).
+
+    The T4 mixed prefill+decode step packs every scheduled query token of every
+    sequence into one row (``B=1``, ``Sq=Q``) and gathers the union of their KV
+    slots into one key axis (``Sk=K``). A query token may attend a key iff they
+    belong to the **same sequence** and the key is **causally at or before** it —
+    which, per sequence, is exactly the standalone causal mask, so the flattened
+    forward is token-for-token identical to running each sequence alone (Seam A).
+
+    ``q_seq_ids`` / ``q_pos`` are ``[Q]`` (each query token's sequence id + absolute
+    position); ``k_seq_ids`` / ``k_pos`` are ``[K]`` (same, per gathered key). Unlike
+    ``build_attention_mask`` (one contiguous q/k range + a left-pad offset) this
+    expresses arbitrary per-token (seq, pos), which is what the packed frame needs.
+    """
+    same_seq = q_seq_ids[:, None] == k_seq_ids[None, :]  # [Q, K]
+    causal = k_pos[None, :] <= q_pos[:, None]  # [Q, K]
+    allowed = same_seq & causal
+    mask = torch.zeros(
+        1, 1, q_seq_ids.shape[0], k_seq_ids.shape[0], dtype=dtype, device=device
+    )
+    return mask.masked_fill(~allowed[None, None, :, :], torch.finfo(dtype).min)

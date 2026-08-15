@@ -27,6 +27,7 @@ from infrared.bench.workload import (
     Category,
     Workload,
     decode_heavy_category,
+    long_prefill_category,
     shared_prefix_category,
 )
 
@@ -82,8 +83,10 @@ def _demo_workload(vocab_size: int, seed: int, block_size: int) -> Workload:
     """A small mixed workload within the model's vocab (token ids, no tokenizer).
 
     Includes a **shared-prefix** category (many prompts, one common preamble
-    spanning ≥1 KV block) so the +prefix-caching tier has something to reuse; the
-    prefix is sized to ``block_size`` so at least one whole block is cacheable.
+    spanning ≥1 KV block) so the +prefix-caching tier has something to reuse, and a
+    **long-prefill** category (multi-block prompts) so the +chunked-prefill tier has
+    a long prefill to spread across steps; the prefix is sized to ``block_size`` so
+    at least one whole block is cacheable.
     """
     short = decode_heavy_category(
         n=4, prompt_len=4, max_new_tokens=8, vocab_size=vocab_size, seed=seed
@@ -99,11 +102,19 @@ def _demo_workload(vocab_size: int, seed: int, block_size: int) -> Workload:
         vocab_size=vocab_size,
         seed=seed + 2,
     )
+    long_prefill = long_prefill_category(
+        n=2,
+        prompt_len=3 * block_size,
+        max_new_tokens=16,
+        vocab_size=vocab_size,
+        seed=seed + 3,
+    )
     return Workload(
         categories=[
             Category(name="short", prompts=short.prompts, max_new_tokens=8),
             Category(name="long", prompts=long.prompts, max_new_tokens=24),
             shared,
+            long_prefill,
         ]
     )
 
@@ -121,6 +132,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--num-blocks", type=int, default=128, help="paged KV pool size in blocks (T3)"
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=8,
+        help="prefill chunk size for the +chunked-prefill tier (T4b)",
     )
     parser.add_argument(
         "--rates",
@@ -222,9 +239,39 @@ def main(argv: list[str] | None = None) -> int:
         f"shared-prefix workload"
     )
 
+    # T4b: prefix caching + chunked prefill. Keep the handle so ``mixed_steps`` (steps
+    # that carried a prefill chunk and a decode together) goes into the row — the
+    # structural evidence a long prefill interleaved with decode instead of blocking.
+    t4b_engine = PagedBatchEngine(
+        model,
+        max_num_seqs=args.max_batch,
+        block_size=args.block_size,
+        num_blocks=args.num_blocks,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
+        chunk_size=args.chunk_size,
+    ).start()
+    try:
+        t4b = measure(
+            t4b_engine,
+            oracle=oracle,
+            workload=workload,
+            slo=slo,
+            rates=rates,
+            tier="T4 +chunked prefill",
+            seed=args.seed,
+            notes="",
+        )
+    finally:
+        t4b_engine.stop()
+    t4b.row.notes = (
+        f"{label} · chunk={args.chunk_size}, budget={t4b_engine.token_budget} · "
+        f"{t4b_engine.mixed_steps} mixed prefill+decode steps on long-prefill workload"
+    )
+
     print(f"# infrared metrics spine — {label}\n")
     print("## Before→after ladder\n")
-    print(build_ladder([t1, t2, t3, t4]))
+    print(build_ladder([t1, t2, t3, t4, t4b]))
     print(
         "\n> **Reading the ladder.** **T2** (continuous batch) removes static"
         " batching's prompt padding + head-of-line waste (batch-fill → 100%) and"
@@ -235,11 +282,14 @@ def main(argv: list[str] | None = None) -> int:
         " (on-demand fixed-size blocks, no worst-case reservation, no"
         " fragmentation); the **throughput/goodput** gain over T2 is attributable"
         " to *batched decode* (one matmul across the running set), which paging"
-        " enables. **T4** (+prefix caching) reuses shared prompt-prefix KV blocks"
+        " enables. **T4 +prefix caching** reuses shared prompt-prefix KV blocks"
         " across requests (see the reused-blocks note): the win shows on"
         " shared-prefix workloads (system prompt / few-shot) as skipped prefill"
         " compute + fewer blocks held; it is a no-op when prompts share nothing."
-        " The Triton paged-attn kernel that fuses the gather is still T4-remaining"
+        " **T4 +chunked prefill** splits a long prefill into chunks mixed with decode"
+        " in one step (see the mixed-steps note), so a long prompt no longer blocks"
+        " the decode queue — the TTFT/TPOT protection for in-flight requests. The"
+        " Triton paged-attn kernel that fuses the gather is still T4-remaining"
         " (R1 §5, §8)."
     )
     print("\n## T1 static batch — knee sweep (request-rate up-scan)\n")
@@ -250,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
     print(render_sweep_markdown(t3.sweep))
     print("\n## T4 +prefix caching — knee sweep (request-rate up-scan)\n")
     print(render_sweep_markdown(t4.sweep))
+    print("\n## T4 +chunked prefill — knee sweep (request-rate up-scan)\n")
+    print(render_sweep_markdown(t4b.sweep))
     return 0
 
 
