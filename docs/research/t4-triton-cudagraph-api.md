@@ -237,7 +237,26 @@ graphs[B].graph.replay()
 logits = buf.logits[:b]                            # consume real rows only
 ```
 
+### 3.5 Sharing one memory pool across the per-bucket graphs
 
+Capturing ~10 batch-size buckets wastes memory if each gets a private pool. PyTorch lets graphs **share a pool** [Context7 `/pytorch/pytorch` notes/cuda.md]:
+
+- **`with torch.cuda.graph(g2, pool=g1.pool()): ...`** — capture `g2` hinting it may reuse `g1`'s pool. `CUDAGraph.pool()` returns the opaque pool handle.
+- Explicit pools also exist: **`torch.cuda.MemPool()`** + **`with torch.cuda.use_mem_pool(pool): ...`**; `g.pool()` / `g.pools()` read them back.
+- Docs note pool sharing is **"common in inference servers with variable batch sizes,"** but shared-pool graphs must be **replayed in capture order and never concurrently**, or one graph's replay overwrites another's outputs.
+
+```python
+graphs = {}; shared = None
+for B in buckets:                       # capture in a fixed order
+    g = torch.cuda.CUDAGraph()
+    ctx = torch.cuda.graph(g) if shared is None else torch.cuda.graph(g, pool=shared)
+    with ctx:
+        static_logits[B] = model(static_in[B])
+    shared = g.pool()                   # subsequent buckets reuse this pool
+    graphs[B] = g
+```
+
+> Flag: `torch.cuda.graph_pool_handle()` (a standalone way to mint a shareable pool handle) is a real documented helper but I verified only the **`g.pool()` / `pool=` / `MemPool` / `use_mem_pool`** forms above via Context7 — prefer those, or confirm `graph_pool_handle()` on the box first.
 
 ## 5. API provenance table (source + verified version)
 
