@@ -160,6 +160,30 @@ def store_kvcache(
 
 
 ### 3.1 Low-level `torch.cuda.CUDAGraph` + `torch.cuda.graph(...)`
+
+Real API (all from PyTorch's official CUDA notes, `docs/source/notes/cuda.md`, via Context7 `/pytorch/pytorch`):
+
+- **`g = torch.cuda.CUDAGraph()`** — the graph object.
+- **`with torch.cuda.graph(g): ...`** — capture context; it auto-sets a side stream as current for the duration.
+- **`g.replay()`** — re-execute the captured work on the *same* memory addresses.
+- **`static_input.copy_(new_data)`** — the only way to feed new data: overwrite the captured buffers in place, then `replay()`.
+
+```python
+g = torch.cuda.CUDAGraph()
+static_in = torch.empty((5,), device="cuda")
+
+# warmup on a side stream (see §3.3), then capture
+with torch.cuda.graph(g):
+    static_out = static_in * 2
+
+static_in.copy_(torch.full((5,), 3, device="cuda"))
+g.replay()          # static_out now holds 6s
+static_in.copy_(torch.full((5,), 4, device="cuda"))
+g.replay()          # static_out now holds 8s
+```
+
+[Context7 `/pytorch/pytorch` notes/cuda.md]
+
 ### 3.2 `make_graphed_callables`
 ### 3.3 Static-input-buffer constraints + warmup
 ### 3.4 Variable-length / paged batches under graphs
