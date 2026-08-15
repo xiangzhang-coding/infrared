@@ -205,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             block_size=args.block_size,
             num_blocks=args.num_blocks,
             enable_prefix_caching=False,  # pure paging — the T4 row adds caching
+            enable_triton_attention=False,  # naive paged — the +Triton row is the A/B
         ),
         tier="T3 +paged KV",
         notes=f"{label} · paged {args.num_blocks}×{args.block_size} · batched decode",
@@ -219,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
         block_size=args.block_size,
         num_blocks=args.num_blocks,
         enable_prefix_caching=True,
+        enable_triton_attention=False,  # naive paged — the +Triton row is the A/B
     ).start()
     try:
         t4 = measure(
@@ -250,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_prefix_caching=True,
         enable_chunked_prefill=True,
         chunk_size=args.chunk_size,
+        enable_triton_attention=False,  # naive paged — the +Triton row is the A/B
     ).start()
     try:
         t4b = measure(
@@ -269,9 +272,43 @@ def main(argv: list[str] | None = None) -> int:
         f"{t4b_engine.mixed_steps} mixed prefill+decode steps on long-prefill workload"
     )
 
+    # T4c: same paged engine, the fused Triton paged-attn kernel on. On CUDA this
+    # replaces the naive gather+attention with one fused kernel (the throughput
+    # win); on a no-GPU box it transparently falls back to the naive path, so the
+    # row equals T4b here — the note says so. The GPU speedup is measured on AutoDL.
+    on_gpu = torch.cuda.is_available()
+    t4c_engine = PagedBatchEngine(
+        model,
+        max_num_seqs=args.max_batch,
+        block_size=args.block_size,
+        num_blocks=args.num_blocks,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
+        chunk_size=args.chunk_size,
+        enable_triton_attention=True,
+    ).start()
+    try:
+        t4c = measure(
+            t4c_engine,
+            oracle=oracle,
+            workload=workload,
+            slo=slo,
+            rates=rates,
+            tier="T4 +Triton kernel",
+            seed=args.seed,
+            notes="",
+        )
+    finally:
+        t4c_engine.stop()
+    t4c.row.notes = f"{label} · fused paged-attn kernel " + (
+        "engaged (CUDA)"
+        if on_gpu
+        else "falls back to naive on CPU (no CUDA) — GPU speedup measured on AutoDL"
+    )
+
     print(f"# infrared metrics spine — {label}\n")
     print("## Before→after ladder\n")
-    print(build_ladder([t1, t2, t3, t4, t4b]))
+    print(build_ladder([t1, t2, t3, t4, t4b, t4c]))
     print(
         "\n> **Reading the ladder.** **T2** (continuous batch) removes static"
         " batching's prompt padding + head-of-line waste (batch-fill → 100%) and"
@@ -288,9 +325,12 @@ def main(argv: list[str] | None = None) -> int:
         " compute + fewer blocks held; it is a no-op when prompts share nothing."
         " **T4 +chunked prefill** splits a long prefill into chunks mixed with decode"
         " in one step (see the mixed-steps note), so a long prompt no longer blocks"
-        " the decode queue — the TTFT/TPOT protection for in-flight requests. The"
-        " Triton paged-attn kernel that fuses the gather is still T4-remaining"
-        " (R1 §5, §8)."
+        " the decode queue — the TTFT/TPOT protection for in-flight requests."
+        " **T4 +Triton kernel** fuses the paged gather + scaled-dot-product +"
+        " online-softmax into one self-written Triton kernel (R1 §5, §8): on CUDA it"
+        " skips materializing the gathered KV + full score matrix (the throughput"
+        " win); on a no-GPU box it falls back to the naive path, so its row matches"
+        " the prior one here and the GPU speedup is measured on AutoDL (see its note)."
     )
     print("\n## T1 static batch — knee sweep (request-rate up-scan)\n")
     print(render_sweep_markdown(t1.sweep))
@@ -302,6 +342,8 @@ def main(argv: list[str] | None = None) -> int:
     print(render_sweep_markdown(t4.sweep))
     print("\n## T4 +chunked prefill — knee sweep (request-rate up-scan)\n")
     print(render_sweep_markdown(t4b.sweep))
+    print("\n## T4 +Triton kernel — knee sweep (request-rate up-scan)\n")
+    print(render_sweep_markdown(t4c.sweep))
     return 0
 
 

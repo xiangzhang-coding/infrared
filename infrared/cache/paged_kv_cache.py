@@ -9,9 +9,12 @@ and a step's new K/V is written with one **scatter**.
 
 ``PagedContext`` bundles the per-forward metadata the attention layer needs:
 which flat slots this step writes (``write_slots``) and, per query row, which
-slots to gather its history from (``gather_slots``, right-padded). This is the
-naive-PyTorch paged path the issue asks for; the Triton ``store_kvcache`` /
-paged-attn kernel that fuses scatter+gather+attention is T4 (R1 §5, §8).
+slots to gather its history from (``gather_slots``, right-padded). The same
+metadata drives **both** backends: the naive-PyTorch gather+``masked_attention``
+path and the fused **Triton paged-attn kernel** (T4c) that reads these slots and
+fuses gather + scaled-dot-product + online-softmax. ``use_triton`` requests the
+kernel; it only engages on CUDA with triton importable, else the naive path runs
+(``infrared/model/triton_attention.py``).
 """
 
 from __future__ import annotations
@@ -77,9 +80,12 @@ class PagedContext:
     row-major order of the query tokens (prefill: the one sequence's ``S`` tokens;
     decode: one slot per batched sequence). ``gather_slots`` ``[B, T]`` — for each
     query row, the slots of its full history (right-padded). The pool is shared;
-    the attention layer indexes it per ``layer_idx``.
+    the attention layer indexes it per ``layer_idx``. ``use_triton`` requests the
+    fused Triton kernel (T4c) over these slots — honoured only on CUDA with triton
+    importable, otherwise the naive PyTorch gather+attention path runs.
     """
 
     pool: PagedKVPool
     write_slots: torch.Tensor
     gather_slots: torch.Tensor
+    use_triton: bool = True

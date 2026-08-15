@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from infrared.model.config import Qwen2Config
+from infrared.model.triton_attention import paged_attention
 
 if TYPE_CHECKING:
     from infrared.cache.kv_cache import KVCache
@@ -167,17 +168,16 @@ class Attention(nn.Module):
         if ctx.paged is None:
             assert ctx.kv_cache is not None
             k_all, v_all = ctx.kv_cache.update(layer_idx, k, v, ctx.start_col)
+            k_all = repeat_kv(k_all, self.n_rep)
+            v_all = repeat_kv(v_all, self.n_rep)
+            out = masked_attention(q, k_all, v_all, ctx.mask, self.scale)
         else:
-            paged = ctx.paged
-            h, d = self.num_kv_heads, self.head_dim
-            paged.pool.write(
-                layer_idx, k.reshape(-1, h, d), v.reshape(-1, h, d), paged.write_slots
+            # Paged path: scatter K/V into the pool, then attend over the gathered
+            # history — via the fused Triton kernel on CUDA (T4c), else the naive
+            # PyTorch gather+masked_attention fallback (numerically equivalent).
+            out = paged_attention(
+                q, k, v, ctx.paged, ctx.mask, layer_idx, self.scale, self.n_rep
             )
-            k_all, v_all = paged.pool.gather(layer_idx, paged.gather_slots)
-        k_all = repeat_kv(k_all, self.n_rep)
-        v_all = repeat_kv(v_all, self.n_rep)
-
-        out = masked_attention(q, k_all, v_all, ctx.mask, self.scale)
         out = out.reshape(b, seq, self.num_heads * self.head_dim)
         return self.o_proj(out)
 

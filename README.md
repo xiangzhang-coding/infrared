@@ -35,7 +35,7 @@ Single RTX 4090 (24 GB) via AutoDL, ¥500 budget (inherited from `inference-lear
 
 ## Repo layout
 
-T0 (single-request forward), T1 (static batching + HTTP), **T2 (continuous batching), and T3 (paged KV)** are implemented and verified (HF parity + the before→after ladder both run green), plus the **metrics spine** (issue #7) that measures any config; T4/T5/T6 are not built yet. Names mirror the R1 architecture blueprint (`docs/research/vllm-v1-nano-vllm-blueprint.md`), split along the one seam that matters — request orchestration vs model execution:
+T0 (single-request forward), T1 (static batching + HTTP), **T2 (continuous batching), T3 (paged KV), and the T4 efficiency tier (prefix caching, chunked prefill, Triton paged-attn kernel)** are implemented and verified (HF parity + the before→after ladder both run green; the Triton kernel's GPU parity is checked on a 4090, with a CPU fallback everywhere else), plus the **metrics spine** (issue #7) that measures any config; T4d (CUDA graphs)/T5/T6 are not built yet. Names mirror the R1 architecture blueprint (`docs/research/vllm-v1-nano-vllm-blueprint.md`), split along the one seam that matters — request orchestration vs model execution:
 
 ```
 infrared/
@@ -43,6 +43,7 @@ infrared/
   model/               # model execution (batch-first; B=1 is the T0 path)
     config.py          #   Qwen2Config, read from HF config.json               (T0)
     layers.py          #   RMSNorm / RoPE / GQA attention / SwiGLU             (T0)
+    triton_attention.py #  fused paged-attn Triton kernel + naive fallback    (T4c)
     inputs.py          #   positions + additive causal/padding masks           (T1)
     qwen2.py           #   Qwen2.5 forward + safetensors loader (tied lm_head) (T0)
     sampler.py         #   greedy / temperature                               (T0)
@@ -123,4 +124,4 @@ The pure math (percentiles, TTFT/TPOT, goodput, knee, renderers) lives in `bench
 
 ## Status
 
-🛠️ **Building** — T0 (single-request forward, HF-parity gated), T1 (static batching + OpenAI-compatible HTTP), T2 (continuous batching), and **T3 (paged KV cache)** are in, plus the **metrics spine** (`python -m infrared.bench`) that scores any config and stacks the `static → continuous → +paged` before→after ladder. T2's iteration-level scheduler drives batch-fill to 100% and streams a real TTFT; T3 draws fixed-size KV blocks from a shared pool on demand (no worst-case reservation, no fragmentation → higher KV-block occupancy and more concurrent sequences per KV budget) and **batches the decode step** across the running set — recovering the throughput/goodput lever, with recompute preemption under pool pressure. Next is T4 (Triton paged-attention kernel + prefix caching + chunked prefill). The plan lives as a [wayfinder map issue](https://github.com/xiangzhang-coding/infrared/issues) with build tickets. See `docs/spec/`, `docs/adr/`, and `CONTEXT.md` for the settled decisions and glossary.
+🛠️ **Building** — T0 (single-request forward, HF-parity gated), T1 (static batching + OpenAI-compatible HTTP), T2 (continuous batching), **T3 (paged KV cache)**, and the **T4 efficiency tier** (prefix caching, chunked prefill, and a self-written **Triton paged-attention kernel**) are in, plus the **metrics spine** (`python -m infrared.bench`) that scores any config and stacks the `static → continuous → +paged → +Triton` before→after ladder. T2's iteration-level scheduler drives batch-fill to 100% and streams a real TTFT; T3 draws fixed-size KV blocks from a shared pool on demand (no worst-case reservation, no fragmentation → higher KV-block occupancy and more concurrent sequences per KV budget) and **batches the decode step** across the running set — recovering the throughput/goodput lever, with recompute preemption under pool pressure. T4 reuses shared prompt-prefix KV across requests, interleaves long prefills with decode, and — on CUDA — fuses the paged gather + scaled-dot-product + online-softmax into one Triton kernel (CPU falls back to the naive path; the GPU speedup is verified on a 4090). Next is T4d (CUDA graphs) then T5/T6. The plan lives as a [wayfinder map issue](https://github.com/xiangzhang-coding/infrared/issues) with build tickets. See `docs/spec/`, `docs/adr/`, and `CONTEXT.md` for the settled decisions and glossary.

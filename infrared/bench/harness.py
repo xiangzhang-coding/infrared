@@ -439,8 +439,9 @@ def measure(
 
 # Tiers below don't exist yet; the ladder names them so the artifact reads as
 # "one row per mechanism, filled in as it's built" rather than silently short.
-# T2 (continuous batch) and T3 (+paged KV) are now built, so they drop off.
-_PENDING_TIERS = ("T4 +Triton kernel",)
+# T2 (continuous), T3 (+paged KV), and the T4 +prefix/+chunked/+Triton-kernel rows
+# are now built, so they drop off; CUDA graphs (T4d) is the next unbuilt tier.
+_PENDING_TIERS = ("T4 +CUDA graphs",)
 
 
 def build_ladder(results: Sequence[MeasureResult], include_pending: bool = True) -> str:

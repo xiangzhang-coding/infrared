@@ -12,7 +12,9 @@ same submit/``Pending`` surface and busy loop. Two things change:
    in one forward — each sequence's ragged history is gathered from its block
    table (``PagedKVPool.gather``), padded, and masked per-sequence. This is the
    throughput lever T2 deferred: one batched matmul instead of a per-sequence
-   loop. (The Triton paged-attn kernel that fuses the gather is T4 — R1 §5/§8.)
+   loop. On CUDA the gather + scaled-dot-product + online-softmax are fused into a
+   self-written **Triton paged-attn kernel** (T4c, ``enable_triton_attention``);
+   on CPU the equivalent naive PyTorch path runs (R1 §5/§8).
 
 **Prefix caching (T4, ``enable_prefix_caching``).** When two requests share a
 prompt prefix (a system prompt / few-shot preamble), the second reuses the first's
@@ -64,10 +66,16 @@ class PagedBatchEngine(ContinuousBatchEngine):
         enable_chunked_prefill: bool = False,
         chunk_size: int = 512,
         max_num_batched_tokens: int | None = None,
+        enable_triton_attention: bool = True,
     ) -> None:
         super().__init__(model, max_num_seqs=max_num_seqs)
         self.block_size = block_size
         self.enable_prefix_caching = enable_prefix_caching
+        # Route paged attention through the fused Triton kernel (T4c) when possible.
+        # It only engages on CUDA with triton importable; on CPU every step falls
+        # back to the naive gather+attention path regardless of this flag. Kept as a
+        # switch so the bench can A/B the naive vs +Triton tiers on a GPU box.
+        self.enable_triton_attention = enable_triton_attention
         # Observable reuse evidence (the T4 win): how many physical prefix blocks
         # / prompt tokens were served from cache instead of allocated + computed.
         self.prefix_reused_blocks = 0
@@ -178,7 +186,12 @@ class PagedBatchEngine(ContinuousBatchEngine):
                 ids,
                 positions,
                 mask,
-                paged=PagedContext(self.pool, write_slots, gather_slots),
+                paged=PagedContext(
+                    self.pool,
+                    write_slots,
+                    gather_slots,
+                    use_triton=self.enable_triton_attention,
+                ),
             )
             seq.num_cached_tokens = length
             if self.enable_prefix_caching:
@@ -241,7 +254,12 @@ class PagedBatchEngine(ContinuousBatchEngine):
             ids,
             positions,
             mask,
-            paged=PagedContext(self.pool, write_slots, gather_slots),
+            paged=PagedContext(
+                self.pool,
+                write_slots,
+                gather_slots,
+                use_triton=self.enable_triton_attention,
+            ),
         )
         next_logits = logits[:, -1]
         for i, seq in enumerate(running):
@@ -425,6 +443,7 @@ class PagedBatchEngine(ContinuousBatchEngine):
                 self.pool,
                 self._slots(write_slots),
                 self._slots(gather_slots).reshape(1, -1),
+                use_triton=self.enable_triton_attention,
             ),
         )
         rows = logits[0]  # [Q, vocab] — one row per packed query token
