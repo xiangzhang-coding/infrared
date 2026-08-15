@@ -92,35 +92,37 @@ def paged_attention(
 
     Shapes: ``q`` ``[B, Sq, H, D]`` (already RoPE'd); ``k``/``v`` ``[B, Sq, H_kv, D]``
     (this step's new, RoPE'd K/V); ``mask`` ``[B, 1, Sq, T]`` additive (0 / ``-inf``).
-    Returns ``[B, Sq, H, D]``. Dispatches to the fused Triton kernel on CUDA (opt-in),
-    else the naive PyTorch paged path — the two are numerically equivalent (Seam A).
+    Returns ``[B, Sq, H, D]``. The K/V scatter into the pool happens **here, once**,
+    before either read path branches — so ``_paged_attention_naive`` /
+    ``_paged_attention_triton`` only *read* the pool and differ solely in how they
+    attend. Dispatches to the fused Triton kernel on CUDA (opt-in), else the naive
+    PyTorch paged path — the two are numerically equivalent (Seam A).
     """
+    h, d = k.shape[-2], k.shape[-1]  # num_kv_heads, head_dim
+    paged.pool.write(
+        layer_idx, k.reshape(-1, h, d), v.reshape(-1, h, d), paged.write_slots
+    )
     if _should_use_triton(q, paged.use_triton):
-        return _paged_attention_triton(q, k, v, paged, mask, layer_idx, scale, n_rep)
-    return _paged_attention_naive(q, k, v, paged, mask, layer_idx, scale, n_rep)
+        return _paged_attention_triton(q, paged, mask, layer_idx, scale, n_rep)
+    return _paged_attention_naive(q, paged, mask, layer_idx, scale, n_rep)
 
 
 def _paged_attention_naive(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
     paged: PagedContext,
     mask: torch.Tensor,
     layer_idx: int,
     scale: float,
     n_rep: int,
 ) -> torch.Tensor:
-    """The T3 path, unchanged: scatter K/V, gather full history, masked softmax.
+    """The T3 read path, unchanged: gather full history, masked one-shot softmax.
 
-    Imported lazily to avoid a layers↔triton_attention import cycle (``layers``
-    imports ``paged_attention`` at top level).
+    Assumes this step's K/V is already scattered into the pool (done by the
+    ``paged_attention`` dispatcher). Imported lazily to avoid a
+    layers↔triton_attention import cycle (``layers`` imports ``paged_attention``).
     """
     from infrared.model.layers import masked_attention, repeat_kv
 
-    h, d = k.shape[-2], k.shape[-1]
-    paged.pool.write(
-        layer_idx, k.reshape(-1, h, d), v.reshape(-1, h, d), paged.write_slots
-    )
     k_all, v_all = paged.pool.gather(layer_idx, paged.gather_slots)
     k_all = repeat_kv(k_all, n_rep)
     v_all = repeat_kv(v_all, n_rep)
@@ -286,7 +288,12 @@ def _paged_attn_kernel():
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             m_i = m_ij
 
-        acc = acc / l_i[:, None]  # final normalize
+        # Defensive guard: a query row that saw no valid key (fully-masked row)
+        # leaves l_i == 0; floor it to 1 so the normalize is 0/1 == 0 instead of
+        # 0/0 == NaN. Real callers never hit this (every query attends ≥ itself,
+        # causally), but it keeps the kernel robust to any mask convention.
+        l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+        acc = acc / l_safe[:, None]  # final normalize
         tl.store(
             o_ptr
             + pid_b * ob
@@ -302,32 +309,27 @@ def _paged_attn_kernel():
 
 def _paged_attention_triton(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
     paged: PagedContext,
     mask: torch.Tensor,
     layer_idx: int,
     scale: float,
     n_rep: int,
 ) -> torch.Tensor:
-    """Scatter this step's K/V (torch), then run the fused gather+attention kernel.
+    """Run the fused gather+attention kernel over the already-scattered pool.
 
-    The K/V scatter stays the pool's torch ``index_copy`` (already efficient on
-    CUDA; R3 §2.5's ``store_kvcache`` Triton kernel is a documented, low-value
-    extension). The kernel then reads the flat pool slice for ``layer_idx`` at the
-    precomputed ``gather_slots`` — reusing infrared's existing paged seam so one
-    kernel covers prefill / decode / mixed via the caller's metadata + mask.
+    This step's K/V is scattered by the ``paged_attention`` dispatcher; the scatter
+    stays the pool's torch ``index_copy`` (already efficient on CUDA — R3 §2.5's
+    ``store_kvcache`` Triton kernel is a documented, low-value extension). The kernel
+    reads the flat pool slice for ``layer_idx`` at the precomputed ``gather_slots`` —
+    reusing infrared's existing paged seam so one kernel covers prefill / decode /
+    mixed via the caller's metadata + mask.
     """
     import triton
 
-    h, d = k.shape[-2], k.shape[-1]
-    paged.pool.write(
-        layer_idx, k.reshape(-1, h, d), v.reshape(-1, h, d), paged.write_slots
-    )
     kc = paged.pool.k[layer_idx]  # [num_slots, H_kv, D] contiguous
     vc = paged.pool.v[layer_idx]
     gather_slots = paged.gather_slots  # [B, T] long
-    b, sq, heads, _ = q.shape
+    b, sq, heads, d = q.shape  # d == head_dim, passed as the HEAD_DIM constexpr
     t = gather_slots.shape[1]
     m2 = mask.reshape(b, sq, t)  # squeeze the head-broadcast dim -> [B, Sq, T]
     out = torch.empty_like(q)
