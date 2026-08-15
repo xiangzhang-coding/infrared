@@ -8,7 +8,7 @@ version = "0.0.0"
 description = "A from-scratch LLM inference engine (Qwen2.5), built tier by tier (T0-T6)."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "xiangzhang-coding" }]
 keywords = [
     "llm",

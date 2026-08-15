@@ -1,5 +1,7 @@
 # infrared
 
+**English** · [中文](README.zh-CN.md)
+
 > A **from-scratch LLM inference engine** — built to learn inference-serving optimization by *implementing* the mechanisms (continuous batching, a paged KV cache, a scheduler, Triton kernels) rather than tuning someone else's flags. Plus a thin serving layer, so it runs end-to-end.
 
 `infrared` is the hands-on companion to [`inference-learning-path`](https://github.com/xiangzhang-coding/inference-learning-path) (a bilingual tutorial site that teaches you to *understand and tune* vLLM). Where that site deliberately stops at "read the source, tune the knobs," `infrared` crosses the line and **builds the engine** — the place high-concurrency / high-utilization stops being knobs you turn and becomes machinery you own.
@@ -15,7 +17,7 @@ Built in rungs; each rung is a mechanism you implement and then **measure** agai
 | **T2** | **Continuous batching** scheduler | the #1 throughput lever; the scheduler as the heart |
 | **T3** | **Paged KV cache** (PagedAttention-style block manager) | the vLLM core innovation; memory utilization |
 | **T4** | Efficiency: Triton paged-attention kernel, prefix caching, chunked prefill, CUDA graphs | the performance half |
-| **T5** | Serving layer: streaming, metrics, load-test harness | the ops / serving-systems half |
+| **T5** | Serving layer: response streaming, live metrics endpoints, serving/ops hardening (the offline metrics + load-test **spine** already landed early — issue #7) | the ops / serving-systems half |
 | **T6** | Beyond: speculative decoding, quantization, multi-LoRA, tensor parallelism | advanced serving |
 
 ## What "done" measures
@@ -125,4 +127,8 @@ The pure math (percentiles, TTFT/TPOT, goodput, knee, renderers) lives in `bench
 
 ## Status
 
-🛠️ **Building** — T0 (single-request forward, HF-parity gated), T1 (static batching + OpenAI-compatible HTTP), T2 (continuous batching), **T3 (paged KV cache)**, and the **T4 efficiency tier** (prefix caching, chunked prefill, and a self-written **Triton paged-attention kernel**) are in, plus the **metrics spine** (`python -m infrared.bench`) that scores any config and stacks the `static → continuous → +paged → +Triton` before→after ladder. T2's iteration-level scheduler drives batch-fill to 100% and streams a real TTFT; T3 draws fixed-size KV blocks from a shared pool on demand (no worst-case reservation, no fragmentation → higher KV-block occupancy and more concurrent sequences per KV budget) and **batches the decode step** across the running set — recovering the throughput/goodput lever, with recompute preemption under pool pressure. T4 reuses shared prompt-prefix KV across requests, interleaves long prefills with decode, and — on CUDA — fuses the paged gather + scaled-dot-product + online-softmax into one Triton kernel and replays the decode step as a captured CUDA graph (CPU falls back to the naive eager path; the GPU parity + speedup are gated to a 4090 run on AutoDL). Next is T5/T6. The plan lives as a [wayfinder map issue](https://github.com/xiangzhang-coding/infrared/issues) with build tickets. See `docs/spec/`, `docs/adr/`, and `CONTEXT.md` for the settled decisions and glossary.
+🛠️ **Building** — T0 (single-request forward, HF-parity gated), T1 (static batching + OpenAI-compatible HTTP), T2 (continuous batching), **T3 (paged KV cache)**, and the **T4 efficiency tier** (prefix caching, chunked prefill, and a self-written **Triton paged-attention kernel**) are in, plus the **metrics spine** (`python -m infrared.bench`) that scores any config and stacks the `static → continuous → +paged → +Triton` before→after ladder. T2's iteration-level scheduler drives batch-fill to 100% and surfaces a real per-request TTFT (it stamps first-token time as each sequence produces it — the HTTP layer still returns the completion non-streamed); T3 draws fixed-size KV blocks from a shared pool on demand (no worst-case reservation, no fragmentation → higher KV-block occupancy and more concurrent sequences per KV budget) and **batches the decode step** across the running set — recovering the throughput/goodput lever, with recompute preemption under pool pressure. T4 reuses shared prompt-prefix KV across requests, interleaves long prefills with decode, and — on CUDA — fuses the paged gather + scaled-dot-product + online-softmax into one Triton kernel and replays the decode step as a captured CUDA graph (CPU falls back to the naive eager path; the GPU parity + speedup are gated to a 4090 run on AutoDL). Next is T5/T6. The plan lives as a [wayfinder map issue](https://github.com/xiangzhang-coding/infrared/issues) with build tickets. See `docs/spec/`, `docs/adr/`, and `CONTEXT.md` for the settled decisions and glossary.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).
