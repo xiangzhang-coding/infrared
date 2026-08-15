@@ -14,7 +14,10 @@ same submit/``Pending`` surface and busy loop. Two things change:
    throughput lever T2 deferred: one batched matmul instead of a per-sequence
    loop. On CUDA the gather + scaled-dot-product + online-softmax are fused into a
    self-written **Triton paged-attn kernel** (T4c, ``enable_triton_attention``);
-   on CPU the equivalent naive PyTorch path runs (R1 §5/§8).
+   on CPU the equivalent naive PyTorch path runs (R1 §5/§8). On CUDA the decode
+   forward can also be captured once per batch-size bucket and **replayed as a CUDA
+   graph** (T4d, ``enable_cuda_graph``) to erase per-step launch overhead; CPU decode
+   stays eager.
 
 **Prefix caching (T4, ``enable_prefix_caching``).** When two requests share a
 prompt prefix (a system prompt / few-shot preamble), the second reuses the first's
@@ -67,6 +70,7 @@ class PagedBatchEngine(ContinuousBatchEngine):
         chunk_size: int = 512,
         max_num_batched_tokens: int | None = None,
         enable_triton_attention: bool = True,
+        enable_cuda_graph: bool = False,
     ) -> None:
         super().__init__(model, max_num_seqs=max_num_seqs)
         self.block_size = block_size
@@ -76,6 +80,13 @@ class PagedBatchEngine(ContinuousBatchEngine):
         # back to the naive gather+attention path regardless of this flag. Kept as a
         # switch so the bench can A/B the naive vs +Triton tiers on a GPU box.
         self.enable_triton_attention = enable_triton_attention
+        # CUDA-graph decode (T4d): capture the decode forward once per batch-size
+        # bucket and replay it, erasing per-step kernel launch overhead. Only ever
+        # engaged on CUDA (see ``_use_cuda_graph``); on CPU decode stays eager and the
+        # decoder is never built. Lazy so the first decode seeds the capture.
+        self.enable_cuda_graph = enable_cuda_graph
+        self._graph_t_max = model.config.max_position_embeddings
+        self._graph_decoder: object | None = None
         # Observable reuse evidence (the T4 win): how many physical prefix blocks
         # / prompt tokens were served from cache instead of allocated + computed.
         self.prefix_reused_blocks = 0
@@ -226,6 +237,45 @@ class PagedBatchEngine(ContinuousBatchEngine):
         if not running:
             return
 
+        # The forward → last-token logits is computed either eagerly or, on CUDA with
+        # graphs enabled, via a captured/replayed decode graph (T4d). Both return
+        # ``[b, vocab]``; the sample/postprocess tail below is shared.
+        if self._use_cuda_graph():
+            next_logits = self._cuda_graph_decoder().decode(
+                [s.block_table for s in running],
+                [s.num_cached_tokens for s in running],
+                [s.last_token for s in running],
+            )
+        else:
+            next_logits = self._decode_logits_eager(running)
+
+        for i, seq in enumerate(running):
+            seq.num_cached_tokens += 1  # the token just written is now cached
+            try:
+                token = self.sampler.sample(
+                    next_logits[i], seq.temperature, seq.generator
+                )
+                self._postprocess(seq, token)
+            except Exception as exc:  # noqa: BLE001 — isolate this seq, keep the rest
+                self._fail_seq(seq, exc)
+        self._record(
+            BatchStats(
+                batch_size=len(running),
+                max_prompt_len=0,
+                prompt_pad_tokens=0,
+                decode_steps=1,
+                decode_slack_tokens=0,  # no finished seq forwarded (no HOL)
+                kv_block_occupancy=self._occupancy(),
+            )
+        )
+
+    def _decode_logits_eager(self, running: list[Sequence]) -> torch.Tensor:
+        """Build this decode step's inputs and run one eager forward → ``[b, vocab]``.
+
+        The default (non-graph) decode: each sequence's new token attends its ragged
+        history gathered from the block table (right-padded to the running max),
+        masked per-sequence. Returns the last-token logits row per sequence.
+        """
         device, dtype = self.model.device, self.model.dtype
         context_lens = [
             s.num_cached_tokens + 1 for s in running
@@ -261,26 +311,26 @@ class PagedBatchEngine(ContinuousBatchEngine):
                 use_triton=self.enable_triton_attention,
             ),
         )
-        next_logits = logits[:, -1]
-        for i, seq in enumerate(running):
-            seq.num_cached_tokens += 1  # the token just written is now cached
-            try:
-                token = self.sampler.sample(
-                    next_logits[i], seq.temperature, seq.generator
-                )
-                self._postprocess(seq, token)
-            except Exception as exc:  # noqa: BLE001 — isolate this seq, keep the rest
-                self._fail_seq(seq, exc)
-        self._record(
-            BatchStats(
-                batch_size=len(running),
-                max_prompt_len=0,
-                prompt_pad_tokens=0,
-                decode_steps=1,
-                decode_slack_tokens=0,  # no finished seq forwarded (no HOL)
-                kv_block_occupancy=self._occupancy(),
+        return logits[:, -1]
+
+    def _use_cuda_graph(self) -> bool:
+        """Graphs on AND a CUDA device present. On CPU this is always False (eager)."""
+        return self.enable_cuda_graph and torch.cuda.is_available()
+
+    def _cuda_graph_decoder(self):
+        """Lazily build the per-bucket CUDA-graph decoder (only reached on CUDA)."""
+        if self._graph_decoder is None:
+            from infrared.engine.cuda_graph import CudaGraphDecoder
+
+            self._graph_decoder = CudaGraphDecoder(
+                self.model,
+                self.pool,
+                max_num_seqs=self.max_num_seqs,
+                t_max=self._graph_t_max,
+                block_size=self.block_size,
+                use_triton=self.enable_triton_attention,
             )
-        )
+        return self._graph_decoder
 
     # --- chunked prefill: the mixed prefill+decode step (T4b) ---------------
 

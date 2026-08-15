@@ -306,9 +306,43 @@ def main(argv: list[str] | None = None) -> int:
         else "falls back to naive on CPU (no CUDA) — GPU speedup measured on AutoDL"
     )
 
+    # T4d: Triton kernel + CUDA-graph decode. On CUDA the decode forward is captured
+    # once per batch-size bucket and replayed (erasing launch overhead); on a no-GPU
+    # box decode stays eager, so this row equals T4c here — the note says so. The
+    # launch-overhead win is measured on AutoDL.
+    t4d_engine = PagedBatchEngine(
+        model,
+        max_num_seqs=args.max_batch,
+        block_size=args.block_size,
+        num_blocks=args.num_blocks,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
+        chunk_size=args.chunk_size,
+        enable_triton_attention=True,
+        enable_cuda_graph=True,
+    ).start()
+    try:
+        t4d = measure(
+            t4d_engine,
+            oracle=oracle,
+            workload=workload,
+            slo=slo,
+            rates=rates,
+            tier="T4 +CUDA graphs",
+            seed=args.seed,
+            notes="",
+        )
+    finally:
+        t4d_engine.stop()
+    t4d.row.notes = f"{label} · decode CUDA-graph replay " + (
+        "engaged (CUDA)"
+        if on_gpu
+        else "disabled on CPU (no CUDA) — decode stays eager; launch win on AutoDL"
+    )
+
     print(f"# infrared metrics spine — {label}\n")
     print("## Before→after ladder\n")
-    print(build_ladder([t1, t2, t3, t4, t4b, t4c]))
+    print(build_ladder([t1, t2, t3, t4, t4b, t4c, t4d]))
     print(
         "\n> **Reading the ladder.** **T2** (continuous batch) removes static"
         " batching's prompt padding + head-of-line waste (batch-fill → 100%) and"
@@ -331,6 +365,10 @@ def main(argv: list[str] | None = None) -> int:
         " skips materializing the gathered KV + full score matrix (the throughput"
         " win); on a no-GPU box it falls back to the naive path, so its row matches"
         " the prior one here and the GPU speedup is measured on AutoDL (see its note)."
+        " **T4 +CUDA graphs** captures the decode forward once per batch-size bucket"
+        " and replays it, erasing per-step kernel launch overhead (the decode-phase"
+        " TPOT/throughput lever); on a no-GPU box decode stays eager, so its row"
+        " matches the prior one here and the win is measured on AutoDL (see its note)."
     )
     print("\n## T1 static batch — knee sweep (request-rate up-scan)\n")
     print(render_sweep_markdown(t1.sweep))
@@ -344,6 +382,8 @@ def main(argv: list[str] | None = None) -> int:
     print(render_sweep_markdown(t4b.sweep))
     print("\n## T4 +Triton kernel — knee sweep (request-rate up-scan)\n")
     print(render_sweep_markdown(t4c.sweep))
+    print("\n## T4 +CUDA graphs — knee sweep (request-rate up-scan)\n")
+    print(render_sweep_markdown(t4d.sweep))
     return 0
 
 
