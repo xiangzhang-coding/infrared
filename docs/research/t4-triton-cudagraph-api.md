@@ -185,6 +185,17 @@ g.replay()          # static_out now holds 8s
 [Context7 `/pytorch/pytorch` notes/cuda.md]
 
 ### 3.2 `make_graphed_callables`
+
+- **`torch.cuda.make_graphed_callables(callable, sample_args)`** — wraps an `nn.Module` (or callable) so its forward/backward run as a graph, while it manages its own internal `CUDAGraph` objects + warmup for you. `sample_args` must match the real inputs' shapes and `requires_grad` state. [Context7 `/pytorch/pytorch` notes/cuda.md]
+- Passing a **tuple of callables** lets them **share one memory pool** (the inference-server variable-batch pattern), but they must then be invoked in the same order they were captured — outputs live in burned-in addresses. [Context7 `/pytorch/pytorch` notes/cuda.md + torch.compiler_cudagraph_trees.md]
+
+```python
+graphed = torch.cuda.make_graphed_callables(module, (sample_input,))
+out = graphed(real_input)   # forward runs as a graph
+```
+
+> For infrared's decode (inference-only, no autograd), the **low-level `CUDAGraph` + explicit static buffers** (§3.1/§3.4) gives more control over the paged metadata than `make_graphed_callables`; the latter is the quick path when a plain module just needs graphing.
+
 ### 3.3 Static-input-buffer constraints + warmup
 ### 3.4 Variable-length / paged batches under graphs
 
