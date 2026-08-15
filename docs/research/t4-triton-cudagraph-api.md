@@ -29,6 +29,15 @@
 - **`tl.constexpr`** — annotate tile sizes / compile-time constants; math constants (e.g. `log2e: tl.constexpr = 1.44269504`) must be assigned to a `constexpr` var inside the kernel. [Context7 test_bindings.py]
 
 
+### 2.2 Loads, stores, block pointers, masking
+
+Two addressing styles, both real; paged-attn uses **both**:
+
+- **Plain pointer + `tl.arange` + mask** (the paged-gather path). Build offsets `offs = base + tl.arange(0, BLOCK)`, then `tl.load(ptr + offs, mask=offs < n, other=0.0)` and `tl.store(ptr + offs, val, mask=...)`. Masking is how you (a) stay in-bounds on ragged tails and (b) keep padded/invalid KV out of the math. This is what a paged kernel uses to gather non-contiguous blocks via a `block_table`. [Context7 test_bindings.py; Sonar → triton-lang.org]
+- **Block pointer** (the contiguous Q/O/tile path). `tl.make_block_ptr(base, shape, strides, offsets, block_shape, order)` returns a tiled view; `tl.load(blk_ptr, boundary_check=(0,1), padding_option="zero")` reads a tile with auto bounds-padding; `tl.advance(blk_ptr, offsets)` slides it to the next tile; `tl.store(blk_ptr, val, boundary_check=...)`. Verified signature: `triton.language.make_block_ptr(base, shape, strides, offsets, block_shape, order, _semantic=None)`; `tl.advance(ptr, offsets)`. [Sonar → triton-lang.org/main/python-api/generated/make_block_ptr; github triton.language.rst]
+
+> **Key shape decision**: paged KV is scattered across physical blocks, so `make_block_ptr` (which assumes a single strided base) does **not** describe the KV gather — vLLM's paged kernels use computed offsets + masked `tl.load` over the `block_table` for KV, and reserve block pointers for the contiguous query/output tiles. [Sonar → vLLM Triton backend deep-dive; arXiv "Anatomy of a Triton Attention Kernel"]
+
 ### 2.3 `tl.dot` + numerically-stable online softmax
 ### 2.4 Minimal GPU-compilable paged-attn kernel skeleton
 ### 2.5 The `store_kvcache` (scatter) kernel skeleton
