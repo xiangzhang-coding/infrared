@@ -12,6 +12,13 @@
 
 ## 1. Version matrix — what pairs with torch 2.12
 
+| Package | Version | How verified |
+|---|---|---|
+| `torch` | **2.12.0** | ADR-0006 verified-green pin (`pyproject.toml`); the 2.12 release is real (PyTorch 2.12 release blog, via Sonar). |
+| `triton` | **unpinned — NOT first-party verified** | We do not pin it (ADR-0006): torch's Linux CUDA wheel resolves it transitively. Sonar found only that torch 2.12 depends on the **upstream `triton` PyPI package** (not `pytorch-triton`); the *exact* version is not stated in first-party release notes. A third-party repackaging (`torch 2.12.0+cu133`) shipped `triton 3.7.0`, but that is **not** an official pin — treat as a hint, not a fact. **Observe the real version with `pip show triton` on the GPU box when T4c lands, then pin.** |
+
+> **Why this matters (ADR-0006)**: R2 fabricated `triton 3.7.1`. The Triton APIs in §2 are verified to exist in the **current Triton `main` docs/source** (Context7 `/triton-lang/triton` + Sonar on triton-lang.org). They are stable, long-standing primitives — but the *version number* torch 2.12 pulls must be read off the machine, never asserted here.
+
 ## 2. Triton paged-attention kernel — the real API
 
 ### 2.1 Decorators / launch / program id
