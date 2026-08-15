@@ -6,7 +6,9 @@
 
 ## 0. TL;DR
 
-_(outline — filled in below)_
+- **Triton paged-attn kernel** = one `@triton.jit` function, gridded over `(seq, head, [q-block])` via `tl.program_id`; it **gathers** paged KV by walking a `block_table` with plain pointer arithmetic + masked `tl.load` (paged KV is non-contiguous, so `tl.make_block_ptr` fits the *contiguous* Q/O tiles, not the paged gather), computes scores with `tl.dot`, and runs a **numerically-stable online softmax** (running `m_i`/`l_i`, `exp2`, rescale-and-accumulate) so it never materializes the full score row. A separate tiny `store_kvcache` `@triton.jit` kernel scatters this step's K/V into `slot_mapping`.
+- **CUDA graphs** = warm up on a side `torch.cuda.Stream`, capture the decode forward once into a `torch.cuda.CUDAGraph()` under the `torch.cuda.graph(g)` context, then per step `static_*.copy_(real)` → `g.replay()`. Buffers are **fixed-shape and long-lived**; inference engines capture **one graph per batch-size bucket**, **pad up** to the bucket, keep **prefill eager**, and **share one memory pool** across the per-bucket graphs.
+- **Honesty flags (ADR-0006)**: the exact **triton version** paired with `torch 2.12.0` is **NOT first-party verified** (see §1) — do not pin it. Every other API below is tagged with its source + verified version in §5.
 
 ## 1. Version matrix — what pairs with torch 2.12
 
