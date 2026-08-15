@@ -258,6 +258,22 @@ for B in buckets:                       # capture in a fixed order
 
 > Flag: `torch.cuda.graph_pool_handle()` (a standalone way to mint a shareable pool handle) is a real documented helper but I verified only the **`g.pool()` / `pool=` / `MemPool` / `use_mem_pool`** forms above via Context7 — prefer those, or confirm `graph_pool_handle()` on the box first.
 
+## 4. Linux/CUDA-only compat notes (lazy import, no CPU path)
+
+Both surfaces are **GPU-only**; infrared keeps a naive PyTorch attention fallback (the existing `masked_attention` in `infrared/model/layers.py`) as the CPU/no-GPU path (T4c ticket). Rules:
+
+- **Lazy-import triton.** `triton` ships **Linux wheels only** (ADR-0006 / `pyproject.toml` marker `platform_system == 'Linux'`). Never `import triton` at module top level — import inside the GPU code path (or guard with `torch.cuda.is_available()`), so macOS/CPU dev + CI (torch without triton) still import `infrared` cleanly.
+  ```python
+  def paged_attn(...):
+      if not torch.cuda.is_available():
+          return masked_attention(...)      # naive fallback (existing seam)
+      import triton, triton.language as tl   # lazy, GPU-only
+      ...
+  ```
+- **CUDA graphs are CUDA-only.** `torch.cuda.CUDAGraph` / `graph()` need a CUDA device; gate capture behind `torch.cuda.is_available()` + an `enforce_eager` config flag. On CPU, decode runs eager.
+- **Naive path is the correctness oracle.** Triton kernel and fallback must produce matching logits (HF parity, ADR-0005); the fallback is what no-GPU CI exercises.
+- **Don't pin triton** (ADR-0006): read the version off the GPU box (`pip show triton`) when T4c lands, then pin.
+
 ## 5. API provenance table (source + verified version)
 
 ## 6. What I could NOT verify (honest gaps)
