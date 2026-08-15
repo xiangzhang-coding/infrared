@@ -276,6 +276,24 @@ Both surfaces are **GPU-only**; infrared keeps a naive PyTorch attention fallbac
 
 ## 5. API provenance table (source + verified version)
 
+| API | Verified via | Version / commit |
+|---|---|---|
+| `@triton.jit`, `tl.program_id`, `tl.num_programs`, `tl.constexpr` | Context7 `/triton-lang/triton` (docs/python-api/triton.rst, test_bindings.py) | Triton `main` docs/source |
+| `tl.load` / `tl.store` (+ `mask=`, `other=`) | Context7 `/triton-lang/triton` (test_bindings.py) | Triton `main` |
+| `tl.arange`, `tl.zeros`, `tl.full`, `tl.where` | Context7 `/triton-lang/triton` (triton.language.rst categories) | Triton `main` |
+| `tl.dot`, `tl.sum`, `tl.max`, `tl.maximum`, `tl.exp2` | Context7 `/triton-lang/triton` (triton.language.rst: linalg/reduction/math ops) | Triton `main` |
+| `tl.make_block_ptr(base, shape, strides, offsets, block_shape, order)`, `tl.advance(ptr, offsets)`, `load(..., boundary_check, padding_option)` | Sonar → triton-lang.org/main/python-api + github triton.language.rst | Triton `main` docs |
+| Online-softmax shape (m_i/l_i, exp2, rescale-accumulate) | Sonar → triton-lang.org tutorial 06 + github `python/tutorials/06-fused-attention.py` | Triton `main` tutorial |
+| vLLM paged-attn grid `(num_heads, num_seqs, max_num_partitions)`, block_table/context_lens/slot_mapping roles | Sonar → docs.vllm.ai paged_attention + vLLM Triton backend deep-dive + arXiv "Anatomy of a Triton Attention Kernel" | vLLM docs (design-level) |
+| `store_kvcache` scatter kernel shape | Sonar → nano-vLLM `layers/attention.py` | nano-vLLM source |
+| `torch.cuda.CUDAGraph()`, `torch.cuda.graph(g)`, `g.replay()`, `static.copy_()` | Context7 `/pytorch/pytorch` (notes/cuda.md) | PyTorch docs `main` (API stable across 2.x; used under torch 2.12.0) |
+| Side-stream warmup + multi-stream capture rule | Context7 `/pytorch/pytorch` (notes/cuda.md) | PyTorch docs `main` |
+| `torch.cuda.make_graphed_callables(callable, sample_args)` | Context7 `/pytorch/pytorch` (notes/cuda.md, torch.compiler_cudagraph_trees.md) | PyTorch docs `main` |
+| Pool sharing: `torch.cuda.graph(g, pool=g1.pool())`, `CUDAGraph.pool()/pools()`, `torch.cuda.MemPool()`, `torch.cuda.use_mem_pool()` | Context7 `/pytorch/pytorch` (notes/cuda.md) | PyTorch docs `main` |
+| Bucketed decode graphs + pad-up + prefill-eager + `enforce_eager` | Sonar → docs.vllm.ai/design/cuda_graphs + nano-vLLM CUDA-graph walkthroughs | vLLM/nano-vLLM (design-level) |
+
+> **Version honesty (ADR-0006)**: Triton/PyTorch API entries are verified to *exist in current first-party docs/source*; they are long-standing primitives, but Context7/Sonar pull from `main`, so I do **not** claim a per-symbol "added in vX" line. `torch==2.12.0` is the repo's verified-green pin; the exact **triton** version is unverified (§1).
+
 ## 6. What I could NOT verify (honest gaps)
 
 ---
