@@ -218,7 +218,26 @@ Verified constraints [Context7 `/pytorch/pytorch` notes/cuda.md]:
 
 ### 3.4 Variable-length / paged batches under graphs
 
-## 4. Linux/CUDA-only compat notes (lazy import, no CPU path)
+The problem: CUDA graphs need fixed shapes, but a decode batch's size and context lengths vary every step. The verified real-world pattern (vLLM + nano-vLLM) [Sonar → docs.vllm.ai/design/cuda_graphs + nano-vLLM CUDA-graph walkthroughs]:
+
+- **Decode-only graphs.** Prefill stays eager (variable seq-len, hard to graph); only the fixed-per-step decode is captured. An `enforce_eager` flag disables all graphs for debugging.
+- **One graph per batch-size bucket.** Capture graphs for a set of sizes, e.g. `[1, 2, 4, 8, ..., 512]`. Each owns fixed-shape static buffers: `input_ids [B,1]`, `positions [B,1]`, `slot_mapping [B]`, `block_tables [B, max_blocks]`, `context_lens [B]`.
+- **Pad up at runtime.** For real batch `b`, pick the smallest bucket `B ≥ b`, `copy_` real data into rows `[:b]`, and pad rows `[b:B]` with sentinels (e.g. `slot_mapping = -1` so the §2.5 scatter skips them; dummy block ids). Then `graph[B].replay()`, read back rows `[:b]`.
+- **Variable context length is fine without re-capture.** `context_lens` is *data* in a fixed-shape buffer; the kernel loops to `max_blocks` and masks by `context_len`. Growing history needs no new graph — only crossing a batch-size bucket does.
+- **Share one memory pool across buckets** via `pool=` (§3.5) — many graphs, bounded memory; replay order must be respected.
+
+```python
+b = len(seqs); B = next_bucket(b)                 # smallest bucket >= b
+buf = graphs[B].buffers
+buf.input_ids[:b].copy_(input_ids); buf.input_ids[b:].fill_(0)
+buf.slot_mapping[:b].copy_(slots);  buf.slot_mapping[b:].fill_(-1)
+buf.block_tables[:b].copy_(block_tables)
+buf.context_lens[:b].copy_(context_lens); buf.context_lens[b:].fill_(0)
+graphs[B].graph.replay()
+logits = buf.logits[:b]                            # consume real rows only
+```
+
+
 
 ## 5. API provenance table (source + verified version)
 
