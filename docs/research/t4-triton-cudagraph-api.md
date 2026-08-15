@@ -39,7 +39,34 @@ Two addressing styles, both real; paged-attn uses **both**:
 > **Key shape decision**: paged KV is scattered across physical blocks, so `make_block_ptr` (which assumes a single strided base) does **not** describe the KV gather — vLLM's paged kernels use computed offsets + masked `tl.load` over the `block_table` for KV, and reserve block pointers for the contiguous query/output tiles. [Sonar → vLLM Triton backend deep-dive; arXiv "Anatomy of a Triton Attention Kernel"]
 
 ### 2.3 `tl.dot` + numerically-stable online softmax
-### 2.4 Minimal GPU-compilable paged-attn kernel skeleton
+
+- **`tl.dot(a, b)`** — the tiled matmul primitive; used twice per block: `qk = tl.dot(q, k)` (scores) and `acc += tl.dot(p, v)` (weighted values). Listed under `triton.language` Linear-Algebra ops. [Context7 `/triton-lang/triton` triton.language.rst]
+- **Online softmax** (FlashAttention-2 style, verified against Triton tutorial 06). Keep per-query-row running state `m_i` (max) and `l_i` (sum-of-exp); stream over KV blocks without ever building the full score row. Uses `tl.maximum`, `tl.max(.., axis=1)`, `tl.exp2`, `tl.sum` — all in `triton.language` math/reduction ops. [Sonar → triton-lang.org tutorial 06 + github `python/tutorials/06-fused-attention.py`; Context7 triton.language.rst]
+
+```python
+# per-row running state
+m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
+l_i = tl.zeros([BLOCK_M], tl.float32)
+acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+qk_scale = sm_scale * 1.44269504  # 1/ln2, so exp2 replaces exp
+
+for blk in range(num_kv_blocks):          # walk this seq's block_table
+    k, v = load_kv_block(...)              # masked tl.load via block_table
+    qk = tl.dot(q, k) * qk_scale           # [BLOCK_M, BLOCK_N]
+    qk = tl.where(valid_mask, qk, -float("inf"))   # causal / context-len mask
+    m_ij = tl.maximum(m_i, tl.max(qk, axis=1))     # new running max
+    p = tl.math.exp2(qk - m_ij[:, None])           # rescaled probs
+    alpha = tl.math.exp2(m_i - m_ij)               # correction for old state
+    l_i = l_i * alpha + tl.sum(p, axis=1)
+    acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+    m_i = m_ij
+
+acc = acc / l_i[:, None]                    # final normalize
+```
+
+> Multiplying the scale by `1/ln2 ≈ 1.44269504` lets the kernel use hardware `exp2` instead of `exp` (a standard tutorial-06 trick). The `-inf` masking + running-max subtraction is exactly the numerical-stability guarantee the ticket asks for. [Sonar → triton-lang.org tutorial 06]
+
+
 ### 2.5 The `store_kvcache` (scatter) kernel skeleton
 
 ## 3. torch CUDA graphs — capture & replay a decode step
