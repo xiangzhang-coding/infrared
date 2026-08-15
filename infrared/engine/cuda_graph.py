@@ -162,7 +162,7 @@ def build_decode_static_inputs(
 class _Captured:
     """A captured decode graph for one bucket + the static buffers it reads/writes."""
 
-    graph: object  # torch.cuda.CUDAGraph
+    graph: torch.cuda.CUDAGraph
     buf: DecodeInputs
     logits: torch.Tensor  # [B, vocab] — written in place by replay()
 
@@ -222,6 +222,9 @@ class CudaGraphDecoder:
             self._capture(bucket, inp)
         else:
             self._copy_inputs(self._graphs[bucket].buf, inp)
+        # Pool-shared graphs must replay in capture order, never concurrently (R3
+        # §3.5); this engine's decode loop is single-threaded and consumes each
+        # replay's logits immediately below, so that ordering holds.
         self._graphs[bucket].graph.replay()
         return self._graphs[bucket].logits[:b]
 
@@ -257,8 +260,6 @@ class CudaGraphDecoder:
         the graph is captured into the shared pool. Follows R3 §3.3's required
         side-stream warmup + rejoin and §3.5's pool sharing.
         """
-        import torch  # noqa: F401 — local ref; torch is module-level too
-
         buf = DecodeInputs(
             inp.ids.clone(),
             inp.positions.clone(),

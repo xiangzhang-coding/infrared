@@ -40,6 +40,8 @@ tests/test_paged_kv.py).
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from infrared.cache.block_manager import BlockManager
@@ -54,6 +56,9 @@ from infrared.model.inputs import (
     build_varlen_mask,
 )
 from infrared.model.qwen2 import Qwen2ForCausalLM
+
+if TYPE_CHECKING:
+    from infrared.engine.cuda_graph import CudaGraphDecoder
 
 
 class PagedBatchEngine(ContinuousBatchEngine):
@@ -71,6 +76,7 @@ class PagedBatchEngine(ContinuousBatchEngine):
         max_num_batched_tokens: int | None = None,
         enable_triton_attention: bool = True,
         enable_cuda_graph: bool = False,
+        graph_max_seq_len: int = 2048,
     ) -> None:
         super().__init__(model, max_num_seqs=max_num_seqs)
         self.block_size = block_size
@@ -85,8 +91,13 @@ class PagedBatchEngine(ContinuousBatchEngine):
         # engaged on CUDA (see ``_use_cuda_graph``); on CPU decode stays eager and the
         # decoder is never built. Lazy so the first decode seeds the capture.
         self.enable_cuda_graph = enable_cuda_graph
-        self._graph_t_max = model.config.max_position_embeddings
-        self._graph_decoder: object | None = None
+        # Fixed captured key axis. Cap it well below the model's full context window
+        # (e.g. 32k) so a decode step gathers/attends at most ``t_max`` keys, not the
+        # whole window masked-to-a-handful — attending 32k keys to save launch
+        # overhead would be net-slower. Sequences whose context exceeds ``t_max`` fall
+        # back to eager decode (see ``_decode_step``).
+        self._graph_t_max = min(model.config.max_position_embeddings, graph_max_seq_len)
+        self._graph_decoder: CudaGraphDecoder | None = None
         # Observable reuse evidence (the T4 win): how many physical prefix blocks
         # / prompt tokens were served from cache instead of allocated + computed.
         self.prefix_reused_blocks = 0
@@ -239,8 +250,11 @@ class PagedBatchEngine(ContinuousBatchEngine):
 
         # The forward → last-token logits is computed either eagerly or, on CUDA with
         # graphs enabled, via a captured/replayed decode graph (T4d). Both return
-        # ``[b, vocab]``; the sample/postprocess tail below is shared.
-        if self._use_cuda_graph():
+        # ``[b, vocab]``; the sample/postprocess tail below is shared. The graph path
+        # only runs while every sequence's context fits the captured key axis
+        # (``t_max``); a longer sequence falls back to eager for that step.
+        max_ctx = max(s.num_cached_tokens + 1 for s in running)
+        if self._use_cuda_graph() and max_ctx <= self._graph_t_max:
             next_logits = self._cuda_graph_decoder().decode(
                 [s.block_table for s in running],
                 [s.num_cached_tokens for s in running],
@@ -317,7 +331,7 @@ class PagedBatchEngine(ContinuousBatchEngine):
         """Graphs on AND a CUDA device present. On CPU this is always False (eager)."""
         return self.enable_cuda_graph and torch.cuda.is_available()
 
-    def _cuda_graph_decoder(self):
+    def _cuda_graph_decoder(self) -> CudaGraphDecoder:
         """Lazily build the per-bucket CUDA-graph decoder (only reached on CUDA)."""
         if self._graph_decoder is None:
             from infrared.engine.cuda_graph import CudaGraphDecoder

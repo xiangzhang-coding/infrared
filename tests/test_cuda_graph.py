@@ -240,6 +240,21 @@ def test_enable_cuda_graph_is_noop_on_cpu() -> None:
     assert run(True) == run(False)  # graph flag makes no difference on CPU
 
 
+def test_graph_key_axis_is_capped_below_full_context_window() -> None:
+    """t_max caps at graph_max_seq_len, and never exceeds the model's context window.
+
+    Guards the review fix: a decode graph must not fix its key axis to the full
+    (e.g. 32k) window — that would gather/attend a huge masked span every step.
+    """
+    from infrared.engine.paged_engine import PagedBatchEngine
+
+    model = _tiny_model()  # max_position_embeddings = 128
+    engine = PagedBatchEngine(model, graph_max_seq_len=64)
+    assert engine._graph_t_max == 64  # capped by the requested max
+    engine = PagedBatchEngine(model, graph_max_seq_len=4096)
+    assert engine._graph_t_max == 128  # capped by the model's context window
+
+
 # --- 5. real capture/replay vs eager — CUDA-only (skips on Mac/CPU) ---------
 
 
