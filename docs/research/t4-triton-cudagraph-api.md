@@ -157,7 +157,7 @@ def store_kvcache(
 - Grid: `store_kvcache[(num_tokens,)](...)`. Prefill scatters a whole prompt; decode scatters one slot per sequence. This is the Triton analogue of infrared's `PagedKVPool.write` naive scatter. [Sonar → nano-vLLM `layers/attention.py` `store_kvcache` shape]
 - `slot < 0` guard lets CUDA-graph decode pad the batch with sentinel `-1` slots (§3.4) without corrupting the pool. All calls (`tl.program_id`, `tl.load`, `tl.store`, `tl.arange`) are verified `triton.language` ops (§5).
 
-
+## 3. torch CUDA graphs — capture & replay a decode step
 
 ### 3.1 Low-level `torch.cuda.CUDAGraph` + `torch.cuda.graph(...)`
 
